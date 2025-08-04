@@ -1,0 +1,16 @@
+[project]
+name = "vis-interpolate"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "cartopy>=0.25.0",
+    "ipykernel>=6.30.0",
+    "matplotlib>=3.10.5",
+    "metpy>=1.7.0",
+    "numpy>=2.2.6",
+    "pandas>=2.3.1",
+    "rioxarray>=0.19.0",
+    "xarray[complete]>=2025.7.1",
+]
