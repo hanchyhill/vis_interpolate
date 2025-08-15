@@ -6,15 +6,18 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "cartopy>=0.25.0",
+    "fiona>=1.10.1",
     "geopandas>=1.1.1",
     "ipykernel>=6.30.0",
     "matplotlib>=3.10.5",
     "metpy>=1.7.0",
     "numpy>=2.2.6",
     "pandas>=2.3.1",
+    "rasterio>=1.4.3",
     "rioxarray>=0.19.0",
     "scikit-image>=0.25.2",
     "scikit-learn>=1.7.1",
     "scipy>=1.16.1",
+    "shapely>=2.1.1",
     "xarray[complete]>=2025.7.1",
 ]
