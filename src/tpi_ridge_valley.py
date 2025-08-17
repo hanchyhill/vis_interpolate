@@ -230,6 +230,10 @@ def main():
         out_prefix = os.path.join(os.path.dirname(args.dem), stem)
     else:
         out_prefix = args.out_prefix
+    
+    # 创建tpi_ridge_valley子目录用于保存PNG图片
+    png_output_dir = os.path.join(os.path.dirname(args.dem), "tpi_ridge_valley")
+    os.makedirs(png_output_dir, exist_ok=True)
 
     with rasterio.open(args.dem) as src:
         dem = src.read(1).astype(np.float32)
@@ -311,7 +315,7 @@ def main():
             plt.title("Classification (−1 valley / 0 slope / +1 ridge)")
             plt.axis("off")
             plt.tight_layout()
-            plt.savefig(out_prefix + "_class.png", dpi=200)
+            plt.savefig(os.path.join(png_output_dir, os.path.basename(out_prefix) + "_class.png"), dpi=200)
             plt.close()
 
             # TPI 直方图（了解阈值）
@@ -322,7 +326,7 @@ def main():
             plt.axvline(high_thr, linestyle="--")
             plt.title("TPI histogram with thresholds")
             plt.tight_layout()
-            plt.savefig(out_prefix + "_tpi_hist.png", dpi=200)
+            plt.savefig(os.path.join(png_output_dir, os.path.basename(out_prefix) + "_tpi_hist.png"), dpi=200)
             plt.close()
 
         print(f"[OK] 窗口={win_px}px，px≈{px_size:.3f}m；"
@@ -331,7 +335,7 @@ def main():
         if args.export_gpkg:
             print(f"  {out_prefix}_polygons.gpkg")
         if args.preview:
-            print(f"  {out_prefix}_class.png\n  {out_prefix}_tpi_hist.png")
+            print(f"  {os.path.join(png_output_dir, os.path.basename(out_prefix) + '_class.png')}\n  {os.path.join(png_output_dir, os.path.basename(out_prefix) + '_tpi_hist.png')}")
 
 
 if __name__ == "__main__":
