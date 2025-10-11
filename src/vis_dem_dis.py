@@ -8,6 +8,8 @@ import cartopy.feature as cfeature
 import cartopy.io.shapereader as shpreader
 import pandas as pd
 import time
+from datetime import datetime, timedelta
+from pathlib import Path
 from sklearn.neighbors import NearestNeighbors
 
 
@@ -15,19 +17,33 @@ from sklearn.neighbors import NearestNeighbors
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS']
 plt.rcParams['axes.unicode_minus'] = False
 
-time_str = '2024120500'
-# path_csv = path.join(path.dirname(__file__), '../data/station_vis_all_estimated.csv')
-path_csv = path.join(path.dirname(__file__), f'../data/station_vis_nation_region_estimated_{time_str}.csv')
-# 读取站点数据
-df_station = pd.read_csv(path_csv)
-print("=== 站点数据信息 ===")
-print(df_station.info())
-print(df_station.head())
+# 全局DEM数据将在主函数中加载
+ds_dem = None
 
-# 读取DEM数据
-ds_dem = xr.open_dataset(r'h:\data\DEM\merged_dem_data.nc')
-print("\n=== DEM数据信息 ===")
-print(ds_dem)
+def get_csv_path_for_time(time_selected: datetime, source_type: str = "national") -> Path:
+    """
+    根据指定时间和数据源类型生成CSV文件路径
+
+    Parameters:
+    time_selected: datetime, 指定时间
+    source_type: str, 数据源类型 ("national" 或 "national_and_regional")
+
+    Returns:
+    Path: CSV文件路径
+    """
+    time_str = time_selected.strftime('%Y%m%d%H%M')
+
+    if source_type == "national":
+        csv_dir = Path(path.dirname(__file__)) / '../data/vis_estimated_base_nation_station'
+        filename = f"station_vis_all_estimated_{time_str}.csv"
+    elif source_type == "national_and_regional":
+        csv_dir = Path(path.dirname(__file__)) / '../data/vis_estimated_base_nation_and_regional_station'
+        filename = f"station_vis_all_estimated_{time_str}_national_and_regional.csv"
+    else:
+        raise ValueError(f"未知的数据源类型: {source_type}")
+
+    return csv_dir / filename
+
 
 def deg2km(lat1, lon1, lat2, lon2):
     """
@@ -342,26 +358,99 @@ def visualize_visibility_result(df_station, vis_da, ds_dem, save_path=None):
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"可视化结果已保存到: {save_path}")
     
-    plt.show()
+    # plt.show()
 
 # 主执行代码
 if __name__ == "__main__":
-    # 创建能见度插值网格
-    vis_grid = create_visibility_grid(
-        df_station, ds_dem, 
-        beta=10.0,      # 垂直方向权重放大因子
-        power=2.0,      # 权重幂次
-        n_neighbors=6   # 使用最近的6个邻居
-    )
-    
-    # 保存插值结果
-    output_file = f'visibility_anisotropic_idw_{time_str}.nc'
-    vis_grid.to_netcdf(output_file)
-    print(f"插值结果已保存到: {output_file}")
-    
-    # 可视化结果
-    visualize_visibility_result(df_station, vis_grid, ds_dem, 
-                               save_path=f'visibility_interpolation_result_{time_str}.png')
+    # 定义日期范围
+    start_date = datetime(2024, 10, 11, 0, 0)
+    end_date = datetime(2025, 10, 11, 0, 0)
+
+    # 选择数据源类型: "national" 或 "national_and_regional"
+    source_type = "national"
+
+    # 定义输出目录
+    output_dir = Path(path.dirname(__file__)) / f'../data/idw_nc/{source_type}'
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 读取DEM数据（全局使用）
+    print("=== 加载DEM数据 ===")
+    ds_dem = xr.open_dataset(r'h:\data\DEM\merged_dem_data.nc')
+    print(f"DEM网格大小: {len(ds_dem.lat)} × {len(ds_dem.lon)}")
+    print(f"经度范围: {ds_dem.lon.min().values:.4f}° - {ds_dem.lon.max().values:.4f}°")
+    print(f"纬度范围: {ds_dem.lat.min().values:.4f}° - {ds_dem.lat.max().values:.4f}°")
+
+    # 时间循环统计
+    current_date = start_date
+    total_hours = int((end_date - start_date).total_seconds() / 3600)
+    processed = 0
+    skipped = 0
+
+    print("\n" + "=" * 80)
+    print(f"能见度空间插值（各向异性IDW）")
+    print(f"数据源类型: {source_type}")
+    print(f"起始时间: {start_date.strftime('%Y-%m-%d %H:%M')}")
+    print(f"结束时间: {end_date.strftime('%Y-%m-%d %H:%M')}")
+    print(f"总时次数: {total_hours}")
+    print(f"输出目录: {output_dir}")
+    print("=" * 80)
+
+    while current_date <= end_date:
+        time_str = current_date.strftime('%Y%m%d%H%M')
+        time_display = current_date.strftime('%Y-%m-%d %H:%M')
+
+        print(f"\n处理时次: {time_display} ({processed + skipped + 1}/{total_hours})")
+
+        # 获取CSV路径
+        csv_path = get_csv_path_for_time(current_date, source_type)
+
+        # 检查文件是否存在
+        if not csv_path.exists():
+            print(f"✗ 文件不存在: {csv_path}")
+            skipped += 1
+            current_date += timedelta(hours=1)
+            continue
+
+        try:
+            # 读取站点数据
+            df_station = pd.read_csv(csv_path)
+            print(f"  站点数量: {len(df_station)}")
+
+            # 创建能见度插值网格
+            vis_grid = create_visibility_grid(
+                df_station, ds_dem,
+                beta=10.0,      # 垂直方向权重放大因子
+                power=2.0,      # 权重幂次
+                n_neighbors=6   # 使用最近的6个邻居
+            )
+
+            # 保存插值结果
+            output_nc = output_dir / f'visibility_anisotropic_idw_{time_str}.nc'
+            vis_grid.to_netcdf(output_nc)
+            print(f"  ✓ 插值结果已保存: {output_nc.name}")
+
+            # 可视化结果（每6小时保存一次图片）
+            if current_date.hour % 6 == 0:
+                output_png = output_dir / f'visibility_interpolation_result_{time_str}.png'
+                visualize_visibility_result(df_station, vis_grid, ds_dem, save_path=str(output_png))
+                print(f"  ✓ 可视化结果已保存: {output_png.name}")
+
+            processed += 1
+
+        except Exception as e:
+            print(f"✗ 处理失败: {e}")
+            skipped += 1
+
+        # 移动到下一个时次（每小时）
+        current_date += timedelta(hours=1)
+
+    # 输出汇总信息
+    print("\n" + "=" * 80)
+    print("处理完成!")
+    print(f"成功处理: {processed} 个时次")
+    print(f"跳过时次: {skipped} 个")
+    print(f"输出目录: {output_dir}")
+    print("=" * 80)
 
 
 
