@@ -51,27 +51,56 @@ def deg2km(lat1, lon1, lat2, lon2):
     """
     将经纬度差值转换为近似的欧氏距离（公里）
     使用简化的球面距离计算
-    
+
     Parameters:
     lat1, lon1, lat2, lon2: float, 两点的经纬度
-    
+
     Returns:
     float: 距离（公里）
     """
     # 平均纬度（用于经度距离计算）
     avg_lat = np.radians((lat1 + lat2) / 2)
-    
+
     # 纬度和经度的差值（转为弧度）
     dlat = np.radians(lat2 - lat1)
     dlon = np.radians(lon2 - lon1)
-    
+
     # 地球半径（公里）
     R = 6371.0
-    
+
     # 计算欧氏距离的近似值
     dx = R * dlon * np.cos(avg_lat)  # 经向距离
     dy = R * dlat                   # 纬向距离
-    
+
+    return np.sqrt(dx**2 + dy**2)
+
+
+def deg2km_vectorized(lat1, lon1, lat2_array, lon2_array):
+    """
+    向量化版本：批量计算从单点到多个点的距离
+    使用简化的球面距离计算
+
+    Parameters:
+    lat1, lon1: float, 起始点的经纬度
+    lat2_array, lon2_array: array, 目标点的经纬度数组
+
+    Returns:
+    array: 距离数组（公里）
+    """
+    # 平均纬度（用于经度距离计算）
+    avg_lat = np.radians((lat1 + lat2_array) / 2)
+
+    # 纬度和经度的差值（转为弧度）
+    dlat = np.radians(lat2_array - lat1)
+    dlon = np.radians(lon2_array - lon1)
+
+    # 地球半径（公里）
+    R = 6371.0
+
+    # 计算欧氏距离的近似值
+    dx = R * dlon * np.cos(avg_lat)  # 经向距离
+    dy = R * dlat                   # 纬向距离
+
     return np.sqrt(dx**2 + dy**2)
 
 
@@ -129,7 +158,7 @@ def anisotropic_idw_interpolation(df_station, target_lons, target_lats, target_e
         batch_end = min(batch_start + batch_size, n_targets)
         batch_size_actual = batch_end - batch_start
         
-        if batch_start % 5000 == 0:
+        if batch_start % 50000 == 0:
             print(f"处理进度: {batch_start}/{n_targets} ({batch_start/n_targets*100:.1f}%)")
         
         # 批量目标点坐标
@@ -147,57 +176,58 @@ def anisotropic_idw_interpolation(df_station, target_lons, target_lats, target_e
             target_lon = target_lons[target_idx]
             target_lat = target_lats[target_idx]
             target_elev = target_elevations[target_idx]
-            
+
             # 跳过目标点海拔为NaN的情况
             if np.isnan(target_elev):
                 continue
-            
+
             # 获取候选邻居的索引
             candidate_indices = indices[i]
-            
-            # 计算各向异性距离
-            aniso_distances = []
-            valid_candidates = []
-            
-            for idx in candidate_indices:
-                station_lon = station_lons[idx]
-                station_lat = station_lats[idx]
-                station_alt = station_alts[idx]
-                
-                # 计算水平距离（转换为公里）
-                horizontal_dist = deg2km(target_lat, target_lon, station_lat, station_lon)
-                
-                # 计算垂直距离（转换为公里，1000m = 1km）
-                vertical_dist = abs(target_elev - station_alt) / 1000.0
-                
-                # 各向异性距离
-                aniso_dist = np.sqrt(horizontal_dist**2 + (beta * vertical_dist)**2)
-                
-                if aniso_dist > 0:  # 避免除零
-                    aniso_distances.append(aniso_dist)
-                    valid_candidates.append(idx)
-            
+
+            # 向量化计算：一次性计算到所有候选点的各向异性距离
+            # 提取候选点的坐标和数据
+            candidate_lons = station_lons[candidate_indices]
+            candidate_lats = station_lats[candidate_indices]
+            candidate_alts = station_alts[candidate_indices]
+
+            # 批量计算水平距离（向量化）
+            horizontal_dists = deg2km_vectorized(target_lat, target_lon,
+                                                 candidate_lats, candidate_lons)
+
+            # 批量计算垂直距离（向量化）
+            vertical_dists = np.abs(target_elev - candidate_alts) / 1000.0
+
+            # 批量计算各向异性距离（向量化）
+            aniso_dists = np.sqrt(horizontal_dists**2 + (beta * vertical_dists)**2)
+
+            # 筛选有效候选点（距离>0，避免除零）
+            valid_mask = aniso_dists > 0
+            valid_dists = aniso_dists[valid_mask]
+            valid_indices = candidate_indices[valid_mask]
+
+            # 如果有效候选点不足，跳过
+            if len(valid_dists) == 0:
+                continue
+
             # 选择最近的n_neighbors个点
-            if len(aniso_distances) >= n_neighbors:
-                # 排序并选择最近的n_neighbors个
-                sorted_indices = np.argsort(aniso_distances)[:n_neighbors]
-                selected_distances = np.array(aniso_distances)[sorted_indices]
-                selected_candidates = np.array(valid_candidates)[sorted_indices]
-                
-                # 计算权重
-                weights = 1.0 / (selected_distances ** power)
-                
-                # 加权平均
-                weighted_vis = np.sum(weights * station_vis[selected_candidates])
-                total_weight = np.sum(weights)
-                
-                interpolated_vis[target_idx] = weighted_vis / total_weight
-            elif len(aniso_distances) > 0:
-                # 如果候选点不足n_neighbors个，使用所有可用的点
-                weights = 1.0 / (np.array(aniso_distances) ** power)
-                weighted_vis = np.sum(weights * station_vis[valid_candidates])
-                total_weight = np.sum(weights)
-                interpolated_vis[target_idx] = weighted_vis / total_weight
+            if len(valid_dists) >= n_neighbors:
+                # 使用argpartition快速选择最小的n_neighbors个（比完全排序快）
+                kth_indices = np.argpartition(valid_dists, n_neighbors-1)[:n_neighbors]
+                selected_dists = valid_dists[kth_indices]
+                selected_indices = valid_indices[kth_indices]
+            else:
+                # 使用所有可用的点
+                selected_dists = valid_dists
+                selected_indices = valid_indices
+
+            # 计算权重（向量化）
+            weights = 1.0 / (selected_dists ** power)
+
+            # 加权平均（向量化）
+            weighted_vis = np.sum(weights * station_vis[selected_indices])
+            total_weight = np.sum(weights)
+
+            interpolated_vis[target_idx] = weighted_vis / total_weight
     
     print("插值完成!")
     valid_count = np.sum(~np.isnan(interpolated_vis))
