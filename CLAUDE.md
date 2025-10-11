@@ -23,13 +23,15 @@ source .venv/bin/activate  # Linux/Mac
 # Dependencies are managed via pyproject.toml
 # Install/update dependencies (if using pip):
 pip install -e .
+
+uv run main.py
 ```
 
 ### Running the Tools
 
 **Interactive main program:**
 ```bash
-python main.py
+uv run main.py
 # Options:
 # 1 - Single DEM interpolation
 # 2 - Batch DEM processing and merging
@@ -39,28 +41,28 @@ python main.py
 **Direct script execution:**
 ```bash
 # Single DEM file interpolation
-python src/dem_interpolation.py
+uv run src/dem_interpolation.py
 
 # Batch processing
-python src/dem_interpolation.py batch
+uv run src/dem_interpolation.py batch
 
 # Visibility interpolation
-python src/vis_dem_dis.py
+uv run src/vis_dem_dis.py
 
 # TPI terrain analysis
-python src/tpi_ridge_valley.py
+uv run src/tpi_ridge_valley.py
 ```
 
 ### Testing
 ```bash
 # Test individual components
-python test_dem_interpolation.py
-python test_visibility_interpolation.py
-python test_batch_processing.py
-python test_boundary_optimization.py
+uv run test_dem_interpolation.py
+uv run test_visibility_interpolation.py
+uv run test_batch_processing.py
+uv run test_boundary_optimization.py
 
 # Debug visualization
-python debug_visibility_visualization.py
+uv run debug_visibility_visualization.py
 ```
 
 ## Architecture and Key Concepts
