@@ -119,7 +119,20 @@ vis_interpolate/
 └── README.md                       # 项目说明
 ```
 
-## 许可证
+## 数据路径
 
-本项目采用MIT许可证。
+### 国家站
+\\10.148.44.81\surf\idea\getSurfAutoOrg4Prov
 
+"\\10.148.44.81\surf\idea\getSurfAutoOrg4Prov\2021\09\SurfAuto_广东_20210901014500.csv"
+f"\\10.148.44.81\surf\idea\getSurfAutoOrg4Prov\{YYYY}\{MM}\SurfAuto_广东_{YYYYMMDDHHmm}00.csv"
+
+### 区域站
+\\10.148.44.81\surf\idea\getSurfAwstOrg4Prov
+"\\10.148.44.81\surf\idea\getSurfAwstOrg4Prov\2024\11\SurfAwst_广东_20241101025000.csv"
+f"\\10.148.44.81\surf\idea\getSurfAwstOrg4Prov\{YYYY}\{MM}\SurfAwst_广东_{YYYYMMDDHHmm}00.csv"
+
+### 国家局5km能见度实况融合产品
+
+http://10.148.8.71:7080/thredds/dodsC/cldas/20251007/VIS_2025100705.NC
+f"http://10.148.8.71:7080/thredds/dodsC/cldas/{YYYYMMDD}/VIS_{YYYYMMDDHH}.NC"
