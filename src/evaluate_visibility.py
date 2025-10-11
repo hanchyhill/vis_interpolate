@@ -208,7 +208,8 @@ def evaluate_visibility_score(vis_data, df_station):
     return results_df, stats
 
 
-def get_vis_score_by_time(time_selected: datetime, fields: list, fields_2: list, field_map: dict):
+def get_vis_score_by_time(time_selected: datetime, fields: list, fields_2: list, field_map: dict,
+                          station_type: str = "national"):
     """
     根据指定时间，获取能见度预报得分
 
@@ -217,6 +218,7 @@ def get_vis_score_by_time(time_selected: datetime, fields: list, fields_2: list,
         fields: list, 国家站字段列表
         fields_2: list, 区域站字段列表
         field_map: dict, 字段映射字典
+        station_type: str, 站点类型 ("national" 或 "regional")
 
     返回:
         results_df: pd.DataFrame, 包含每个站点的对比结果
@@ -228,11 +230,21 @@ def get_vis_score_by_time(time_selected: datetime, fields: list, fields_2: list,
     url_path_cldas_vis = files_selected["cldas_vis"]["url"]
 
     try:
-        # 读取国家站数据
-        df_nation = pd.read_csv(file_path_nation, encoding='gbk', na_values=9999, usecols=fields)
-        df_nation = df_nation.rename(columns=field_map)
+        if station_type == "national":
+            # 读取国家站数据
+            df_station = pd.read_csv(file_path_nation, encoding='gbk', na_values=9999, usecols=fields)
+            df_station = df_station.rename(columns=field_map)
+        elif station_type == "regional":
+            # 读取区域站数据
+            df_station = pd.read_csv(file_path_region, encoding='gbk', na_values=9999, usecols=fields_2)
+            df_station = df_station.rename(columns=field_map)
+            # 去除掉df_station中vis或county为NaN的条目
+            df_station = df_station.dropna(subset=['vis', 'county'])
+        else:
+            print(f"  ⚠ 未知的站点类型: {station_type}")
+            return None, None
     except Exception as e:
-        print(f"  ⚠ 读取国家站数据失败: {e}")
+        print(f"  ⚠ 读取{station_type}站数据失败: {e}")
         return None, None
 
     # 读取能见度预报数据
@@ -241,7 +253,7 @@ def get_vis_score_by_time(time_selected: datetime, fields: list, fields_2: list,
         return None, None
 
     # 评估能见度预报效果
-    results_df, stats = evaluate_visibility_score(vis_data, df_nation)
+    results_df, stats = evaluate_visibility_score(vis_data, df_station)
 
     return results_df, stats
 
@@ -298,16 +310,18 @@ def main():
     }
 
     # 初始化统计结果列表
-    all_stats = []
+    all_stats_national = []
+    all_stats_regional = []
 
     # 时间循环
     current_date = start_date
     total_hours = int((end_date - start_date).total_seconds() / 3600)
-    processed = 0
+    processed_national = 0
+    processed_regional = 0
     skipped = 0
 
     print("=" * 80)
-    print(f"能见度预报检验")
+    print(f"能见度预报检验 (国家站 + 区域站)")
     print(f"起始时间: {start_date.strftime('%Y-%m-%d %H:%M')}")
     print(f"结束时间: {end_date.strftime('%Y-%m-%d %H:%M')}")
     print(f"总时次数: {total_hours}")
@@ -315,55 +329,104 @@ def main():
 
     while current_date <= end_date:
         time_str = current_date.strftime('%Y%m%d%H')
-        print(f"\n处理时次: {current_date.strftime('%Y-%m-%d %H:%M')} ({processed + skipped + 1}/{total_hours})")
+        print(f"\n处理时次: {current_date.strftime('%Y-%m-%d %H:%M')} ({processed_national + processed_regional // 2 + skipped + 1}/{total_hours})")
 
-        # 执行检验
-        results_df, stats = get_vis_score_by_time(current_date, fields, fields_2, field_map)
+        # 执行国家站检验
+        print("  [国家站]", end=" ")
+        results_df_national, stats_national = get_vis_score_by_time(
+            current_date, fields, fields_2, field_map, station_type="national"
+        )
 
-        if results_df is not None and stats is not None:
+        if results_df_national is not None and stats_national is not None:
             # 保存详细结果
-            detail_file = output_dir / f"vis_score_detail_{time_str}.csv"
-            results_df.to_csv(detail_file, index=False, encoding='utf-8-sig')
+            detail_file = output_dir / f"vis_score_detail_national_{time_str}.csv"
+            results_df_national.to_csv(detail_file, index=False, encoding='utf-8-sig')
 
             # 添加时间信息到统计结果
-            stats['datetime'] = current_date
-            stats['time_str'] = time_str
-            all_stats.append(stats)
+            stats_national['datetime'] = current_date
+            stats_national['time_str'] = time_str
+            stats_national['station_type'] = 'national'
+            all_stats_national.append(stats_national)
 
-            print(f"  ✓ 检验完成 | 样本数: {stats['n_stations']} | MAE: {stats['mae']:.2f} km | RMSE: {stats['rmse']:.2f} km | R: {stats['correlation']:.4f}")
-            processed += 1
+            print(f"✓ 样本数: {stats_national['n_stations']} | MAE: {stats_national['mae']:.2f} km | RMSE: {stats_national['rmse']:.2f} km | R: {stats_national['correlation']:.4f}")
+            processed_national += 1
         else:
-            print(f"  ✗ 跳过该时次（数据不可用）")
+            print("✗ 数据不可用")
+
+        # 执行区域站检验
+        print("  [区域站]", end=" ")
+        results_df_regional, stats_regional = get_vis_score_by_time(
+            current_date, fields, fields_2, field_map, station_type="regional"
+        )
+
+        if results_df_regional is not None and stats_regional is not None:
+            # 保存详细结果
+            detail_file = output_dir / f"vis_score_detail_regional_{time_str}.csv"
+            results_df_regional.to_csv(detail_file, index=False, encoding='utf-8-sig')
+
+            # 添加时间信息到统计结果
+            stats_regional['datetime'] = current_date
+            stats_regional['time_str'] = time_str
+            stats_regional['station_type'] = 'regional'
+            all_stats_regional.append(stats_regional)
+
+            print(f"✓ 样本数: {stats_regional['n_stations']} | MAE: {stats_regional['mae']:.2f} km | RMSE: {stats_regional['rmse']:.2f} km | R: {stats_regional['correlation']:.4f}")
+            processed_regional += 1
+        else:
+            print("✗ 数据不可用")
+
+        # 如果国家站和区域站都失败，计数跳过
+        if (results_df_national is None or stats_national is None) and \
+           (results_df_regional is None or stats_regional is None):
             skipped += 1
 
         # 移动到下一个时次（每小时）
         current_date += timedelta(hours=1)
 
     # 保存汇总统计结果
-    if all_stats:
-        summary_df = pd.DataFrame(all_stats)
-        summary_file = output_dir / "vis_score_summary.csv"
-        summary_df.to_csv(summary_file, index=False, encoding='utf-8-sig')
+    print("\n" + "=" * 80)
+    print("检验完成!")
+    print(f"国家站成功处理: {processed_national} 个时次")
+    print(f"区域站成功处理: {processed_regional} 个时次")
+    print(f"完全跳过时次: {skipped} 个")
+    print(f"详细结果保存至: {output_dir}")
+    print("=" * 80)
 
-        print("\n" + "=" * 80)
-        print("检验完成!")
-        print(f"成功处理: {processed} 个时次")
-        print(f"跳过时次: {skipped} 个")
-        print(f"详细结果保存至: {output_dir}")
-        print(f"汇总文件: {summary_file}")
-        print("=" * 80)
+    # 保存国家站汇总
+    if all_stats_national:
+        summary_df_national = pd.DataFrame(all_stats_national)
+        summary_file_national = output_dir / "vis_score_summary_national.csv"
+        summary_df_national.to_csv(summary_file_national, index=False, encoding='utf-8-sig')
 
-        # 打印整体统计
-        print("\n整体统计 (所有时次平均):")
-        print(f"  平均样本数: {summary_df['n_stations'].mean():.0f}")
-        print(f"  平均观测值: {summary_df['mean_obs'].mean():.2f} km")
-        print(f"  平均预报值: {summary_df['mean_forecast'].mean():.2f} km")
-        print(f"  平均偏差 (Bias): {summary_df['bias'].mean():.2f} km")
-        print(f"  平均绝对误差 (MAE): {summary_df['mae'].mean():.2f} km")
-        print(f"  均方根误差 (RMSE): {summary_df['rmse'].mean():.2f} km")
-        print(f"  平均相关系数 (R): {summary_df['correlation'].mean():.4f}")
-        print(f"  平均相对误差 (MAPE): {summary_df['mape'].mean():.2f}%")
-    else:
+        print("\n国家站整体统计 (所有时次平均):")
+        print(f"  汇总文件: {summary_file_national}")
+        print(f"  平均样本数: {summary_df_national['n_stations'].mean():.0f}")
+        print(f"  平均观测值: {summary_df_national['mean_obs'].mean():.2f} km")
+        print(f"  平均预报值: {summary_df_national['mean_forecast'].mean():.2f} km")
+        print(f"  平均偏差 (Bias): {summary_df_national['bias'].mean():.2f} km")
+        print(f"  平均绝对误差 (MAE): {summary_df_national['mae'].mean():.2f} km")
+        print(f"  均方根误差 (RMSE): {summary_df_national['rmse'].mean():.2f} km")
+        print(f"  平均相关系数 (R): {summary_df_national['correlation'].mean():.4f}")
+        print(f"  平均相对误差 (MAPE): {summary_df_national['mape'].mean():.2f}%")
+
+    # 保存区域站汇总
+    if all_stats_regional:
+        summary_df_regional = pd.DataFrame(all_stats_regional)
+        summary_file_regional = output_dir / "vis_score_summary_regional.csv"
+        summary_df_regional.to_csv(summary_file_regional, index=False, encoding='utf-8-sig')
+
+        print("\n区域站整体统计 (所有时次平均):")
+        print(f"  汇总文件: {summary_file_regional}")
+        print(f"  平均样本数: {summary_df_regional['n_stations'].mean():.0f}")
+        print(f"  平均观测值: {summary_df_regional['mean_obs'].mean():.2f} km")
+        print(f"  平均预报值: {summary_df_regional['mean_forecast'].mean():.2f} km")
+        print(f"  平均偏差 (Bias): {summary_df_regional['bias'].mean():.2f} km")
+        print(f"  平均绝对误差 (MAE): {summary_df_regional['mae'].mean():.2f} km")
+        print(f"  均方根误差 (RMSE): {summary_df_regional['rmse'].mean():.2f} km")
+        print(f"  平均相关系数 (R): {summary_df_regional['correlation'].mean():.4f}")
+        print(f"  平均相对误差 (MAPE): {summary_df_regional['mape'].mean():.2f}%")
+
+    if not all_stats_national and not all_stats_regional:
         print("\n未能处理任何时次，请检查数据源。")
 
 
