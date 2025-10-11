@@ -136,3 +136,11 @@ f"\\10.148.44.81\surf\idea\getSurfAwstOrg4Prov\{YYYY}\{MM}\SurfAwst_广东_{YYYY
 
 http://10.148.8.71:7080/thredds/dodsC/cldas/20251007/VIS_2025100705.NC
 f"http://10.148.8.71:7080/thredds/dodsC/cldas/{YYYYMMDD}/VIS_{YYYYMMDDHH}.NC"
+
+## 插值算法流程
+
+
+[csv数据处理](src/get_vis_estimated_by_rh.py)
+[csv数据根据地形插值计算](src/vis_dem_dis.py)->输出[插值结果数据](src/visibility_anisotropic_idw.nc)
+
+[插值结果可视化](debug_visibility_visualization.py)

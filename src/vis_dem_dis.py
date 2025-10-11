@@ -15,7 +15,9 @@ from sklearn.neighbors import NearestNeighbors
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS']
 plt.rcParams['axes.unicode_minus'] = False
 
-path_csv = path.join(path.dirname(__file__), '../data/station_vis_all_estimated.csv')
+time_str = '2024120500'
+# path_csv = path.join(path.dirname(__file__), '../data/station_vis_all_estimated.csv')
+path_csv = path.join(path.dirname(__file__), f'../data/station_vis_nation_region_estimated_{time_str}.csv')
 # 读取站点数据
 df_station = pd.read_csv(path_csv)
 print("=== 站点数据信息 ===")
@@ -353,13 +355,13 @@ if __name__ == "__main__":
     )
     
     # 保存插值结果
-    output_file = 'visibility_anisotropic_idw.nc'
+    output_file = f'visibility_anisotropic_idw_{time_str}.nc'
     vis_grid.to_netcdf(output_file)
     print(f"插值结果已保存到: {output_file}")
     
     # 可视化结果
     visualize_visibility_result(df_station, vis_grid, ds_dem, 
-                               save_path='visibility_interpolation_result.png')
+                               save_path=f'visibility_interpolation_result_{time_str}.png')
 
 
 

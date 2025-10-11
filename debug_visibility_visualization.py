@@ -172,7 +172,7 @@ def load_visibility_data(data_path='src/visibility_anisotropic_idw.nc'):
     """
     加载能见度数据
     """
-    if not path.exists(data_path):
+    if not data_path.startswith('http') and not path.exists(data_path):
         print(f"错误：找不到文件 {data_path}")
         print("请确保已运行插值程序生成该文件")
         return None
@@ -524,35 +524,36 @@ def main():
     print("开始能见度数据调试可视化...")
     
     # 加载数据
-    vis_data = load_visibility_data('data/VIS_2025022800.NC')
+    time_str = '2024120500'
+    nc_file_path = f"H:/github/python/vis_interpolate/data/visibility_anisotropic_idw_{time_str}.nc"
+    cldas_url = "http://10.148.8.71:7080/thredds/dodsC/cldas/20241205/VIS_2024120500.NC"
+    vis_data = load_visibility_data(cldas_url) # 'data/VIS_2025022800.NC'
     if vis_data is None:
         return
-    
     # 加载广东省边界（用于统计分析）
     gdf_guangdong = load_guangdong_boundary()
-    
     # 应用广东省遮罩
     vis_data_masked = apply_guangdong_mask(vis_data, gdf_guangdong)
-    
     # 打印统计信息
     print_visibility_statistics(vis_data, "原始能见度数据统计分析")
     print_visibility_statistics(vis_data_masked, "广东省范围能见度数据统计分析")
-    
     # 创建综合可视化
     print("\n创建综合可视化图...")
-    create_comprehensive_visualization(vis_data)
-    
+    comprehensive_save_path = f'debug_visibility_comprehensive_{time_str}.png'
+    comprehensive_save_path = f'cldas_debug_visibility_comprehensive_{time_str}.png'
+    create_comprehensive_visualization(vis_data, comprehensive_save_path)
     # 创建雾区域详细可视化
     print("创建雾区域详细可视化...")
-    create_detailed_fog_visualization(vis_data)
-    
+    detailed_fog_save_path = f'debug_visibility_fog_detail_{time_str}.png'
+    detailed_fog_save_path = f'cldas_debug_visibility_fog_detail_{time_str}.png'
+    create_detailed_fog_visualization(vis_data, detailed_fog_save_path)
+    print(f"雾区域详细可视化已保存至: {detailed_fog_save_path}")
     print("\n可视化完成！生成的文件：")
-    print("1. debug_visibility_comprehensive.png - 综合对比图（含广东省遮罩）")
-    print("2. debug_visibility_fog_detail.png - 雾区域详细图（含广东省遮罩）")
+    print(f"1. debug_visibility_comprehensive_{time_str}.png - 综合对比图（含广东省遮罩）")
+    print(f"2. debug_visibility_fog_detail_{time_str}.png - 雾区域详细图（含广东省遮罩）")
     print("\n所有图像已应用广东省边界遮罩，只显示广东省范围内的数据")
-    
     # 显示图片
-    plt.show()
+    # plt.show()
 
 
 if __name__ == "__main__":

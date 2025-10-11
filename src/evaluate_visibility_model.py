@@ -58,11 +58,18 @@ def build_filenames_and_urls(ts: datetime, province: str = "广东") -> Dict[str
     vis_dir_yyyymmdd = f"{YYYY}{MM}{DD}"
     vis_filename = f"VIS_{YYYY}{MM}{DD}{HH}.NC"
     vis_url = f"http://10.148.8.71:7080/thredds/dodsC/cldas/{vis_dir_yyyymmdd}/{vis_filename}"
+    
+    # DEM 
+    dem_filename = f"visibility_anisotropic_idw_{YYYY}{MM}{DD}{HH}.nc"
+    dem_fullpath = str(
+        PureWindowsPath(r"H:\github\python\vis_interpolate\data\idw_nc") / dem_filename
+    )
 
     return {
         "national":  {"filename": national_filename, "fullpath": national_fullpath},
         "regional":  {"filename": regional_filename, "fullpath": regional_fullpath},
         "cldas_vis": {"filename": vis_filename, "url": vis_url},
+        "dem_vis": {"filename": dem_filename, "fullpath": dem_fullpath},
     }
 
 
@@ -271,7 +278,7 @@ def get_vis_score_by_time(time_selected: datetime, fields: list, fields_2: list,
     # 检查是否存在缓存文件
     if use_cache and output_dir is not None:
         time_str = time_selected.strftime('%Y%m%d%H')
-        cache_file = output_dir / f"vis_score_detail_{station_type}_{time_str}.csv"
+        cache_file = output_dir / f"vis_score_detail_{station_type}_{time_str}_dem_model.csv"
 
         if cache_file.exists():
             print(f"[缓存]", end=" ")
@@ -281,6 +288,7 @@ def get_vis_score_by_time(time_selected: datetime, fields: list, fields_2: list,
     file_path_nation = files_selected["national"]["fullpath"]
     file_path_region = files_selected["regional"]["fullpath"]
     url_path_cldas_vis = files_selected["cldas_vis"]["url"]
+    dem_vis_path = files_selected["dem_vis"]["fullpath"]
 
     try:
         if station_type == "national":
@@ -301,7 +309,7 @@ def get_vis_score_by_time(time_selected: datetime, fields: list, fields_2: list,
         return None, None
 
     # 读取能见度预报数据
-    vis_data = load_visibility_data(url_path_cldas_vis)
+    vis_data = load_visibility_data(dem_vis_path)
     if vis_data is None:
         return None, None
 
@@ -316,11 +324,11 @@ def main():
     主函数：循环检验指定日期范围内的能见度预报
     """
     # 定义日期范围
-    start_date = datetime(2024, 10, 11, 0, 0)
-    end_date = datetime(2025, 10, 11, 0, 0)
+    start_date = datetime(2024, 12, 5, 0, 0)
+    end_date = datetime(2024, 12, 5, 0, 0)
 
     # 定义输出目录
-    output_dir = Path(r"H:\github\python\vis_interpolate\data\cldas_score")
+    output_dir = Path(r"H:\github\python\vis_interpolate\data\dem_model_score")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 定义字段
@@ -393,7 +401,7 @@ def main():
 
         if results_df_national is not None and stats_national is not None:
             # 保存详细结果（仅当不是从缓存读取时）
-            detail_file = output_dir / f"vis_score_detail_national_{time_str}.csv"
+            detail_file = output_dir / f"vis_score_detail_national_{time_str}_dem_model.csv"
             if not detail_file.exists():
                 results_df_national.to_csv(detail_file, index=False, encoding='utf-8-sig')
 
@@ -417,7 +425,7 @@ def main():
 
         if results_df_regional is not None and stats_regional is not None:
             # 保存详细结果（仅当不是从缓存读取时）
-            detail_file = output_dir / f"vis_score_detail_regional_{time_str}.csv"
+            detail_file = output_dir / f"vis_score_detail_regional_{time_str}_dem_model.csv"
             if not detail_file.exists():
                 results_df_regional.to_csv(detail_file, index=False, encoding='utf-8-sig')
 
@@ -452,7 +460,7 @@ def main():
     # 保存国家站汇总
     if all_stats_national:
         summary_df_national = pd.DataFrame(all_stats_national)
-        summary_file_national = output_dir / "vis_score_summary_national.csv"
+        summary_file_national = output_dir / "vis_score_summary_nationall_dem_model.csv"
         summary_df_national.to_csv(summary_file_national, index=False, encoding='utf-8-sig')
 
         print("\n国家站整体统计 (所有时次平均):")
@@ -469,7 +477,7 @@ def main():
     # 保存区域站汇总
     if all_stats_regional:
         summary_df_regional = pd.DataFrame(all_stats_regional)
-        summary_file_regional = output_dir / "vis_score_summary_regional.csv"
+        summary_file_regional = output_dir / "vis_score_summary_regional_dem_model.csv"
         summary_df_regional.to_csv(summary_file_regional, index=False, encoding='utf-8-sig')
 
         print("\n区域站整体统计 (所有时次平均):")
