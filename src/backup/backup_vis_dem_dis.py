@@ -105,177 +105,134 @@ def deg2km_vectorized(lat1, lon1, lat2_array, lon2_array):
 
 
 
-def deg2km_batch(lat1_array, lon1_array, lat2_array, lon2_array):
-    """
-    完全向量化版本：批量计算多对多点的距离
-    支持广播操作
-
-    Parameters:
-    lat1_array, lon1_array: array, 起始点的经纬度数组（可以是1D或2D）
-    lat2_array, lon2_array: array, 目标点的经纬度数组（可以是1D或2D）
-
-    Returns:
-    array: 距离数组（公里）
-    """
-    # 平均纬度（用于经度距离计算）
-    avg_lat = np.radians((lat1_array + lat2_array) / 2)
-
-    # 纬度和经度的差值（转为弧度）
-    dlat = np.radians(lat2_array - lat1_array)
-    dlon = np.radians(lon2_array - lon1_array)
-
-    # 地球半径（公里）
-    R = 6371.0
-
-    # 计算欧氏距离的近似值
-    dx = R * dlon * np.cos(avg_lat)  # 经向距离
-    dy = R * dlat                   # 纬向距离
-
-    return np.sqrt(dx**2 + dy**2)
-
-
-def anisotropic_idw_interpolation(df_station, target_lons, target_lats, target_elevations,
+def anisotropic_idw_interpolation(df_station, target_lons, target_lats, target_elevations, 
                                  beta=10.0, power=2.0, n_neighbors=6):
     """
-    各向异性反距离权重插值（完全向量化版本）
-
+    各向异性反距离权重插值
+    
     Parameters:
     df_station: DataFrame, 站点数据，包含 lon, lat, vis, altitude 字段
     target_lons: array, 目标点经度
-    target_lats: array, 目标点纬度
+    target_lats: array, 目标点纬度  
     target_elevations: array, 目标点海拔
     beta: float, 垂直方向权重放大因子，默认10.0
     power: float, 权重幂次，默认2.0
     n_neighbors: int, 使用的邻居数量，默认6
-
+    
     Returns:
     array: 插值后的能见度值
     """
-    print(f"开始各向异性IDW插值（完全向量化），使用{n_neighbors}个最近邻居，β={beta}, p={power}")
-
+    print(f"开始各向异性IDW插值，使用{n_neighbors}个最近邻居，β={beta}, p={power}")
+    
     # 提取站点数据
     station_lons = df_station['lon'].values
-    station_lats = df_station['lat'].values
+    station_lats = df_station['lat'].values  
     station_vis = df_station['vis'].values
     station_alts = df_station['altitude'].values
-
+    
     # 检查数据有效性
     valid_mask = (~np.isnan(station_vis)) & (~np.isnan(station_alts))
     station_lons = station_lons[valid_mask]
     station_lats = station_lats[valid_mask]
     station_vis = station_vis[valid_mask]
     station_alts = station_alts[valid_mask]
-
+    
     print(f"有效站点数量: {len(station_lons)}")
-
+    
     # 将站点经纬度转换为平面坐标（用于快速邻居搜索）
     station_coords_2d = np.column_stack([station_lons, station_lats])
-
-    # 建立最近邻搜索器
-    k_search = min(n_neighbors * 2, len(station_lons))
-    nbrs = NearestNeighbors(n_neighbors=k_search, algorithm='ball_tree').fit(station_coords_2d)
-
+    
+    # 建立最近邻搜索器（仅用于快速筛选候选点）
+    nbrs = NearestNeighbors(n_neighbors=min(n_neighbors*2, len(station_lons)), 
+                           algorithm='ball_tree').fit(station_coords_2d)
+    
     # 目标点数量
     n_targets = len(target_lons)
     interpolated_vis = np.full(n_targets, np.nan)
-
+    
     print(f"开始插值 {n_targets} 个目标点...")
-
-    # 批处理以控制内存占用
-    batch_size = 10000  # 增大批量大小以利用向量化优势
+    
+    # 批处理以提高效率
+    batch_size = 1000
     for batch_start in range(0, n_targets, batch_size):
         batch_end = min(batch_start + batch_size, n_targets)
-
-        # if batch_start % 50000 == 0:
-        #     print(f"处理进度: {batch_start}/{n_targets} ({batch_start/n_targets*100:.1f}%)")
-
+        batch_size_actual = batch_end - batch_start
+        
+        if batch_start % 50000 == 0:
+            print(f"处理进度: {batch_start}/{n_targets} ({batch_start/n_targets*100:.1f}%)")
+        
         # 批量目标点坐标
-        batch_target_lons = target_lons[batch_start:batch_end]
-        batch_target_lats = target_lats[batch_start:batch_end]
-        batch_target_elevs = target_elevations[batch_start:batch_end]
-        batch_size_actual = len(batch_target_lons)
+        batch_target_coords = np.column_stack([
+            target_lons[batch_start:batch_end],
+            target_lats[batch_start:batch_end]
+        ])
+        
+        # 对每个批次中的目标点，找到候选邻居
+        distances_2d, indices = nbrs.kneighbors(batch_target_coords)
+        
+        # 对批次中的每个目标点进行插值
+        for i in range(batch_size_actual):
+            target_idx = batch_start + i
+            target_lon = target_lons[target_idx]
+            target_lat = target_lats[target_idx]
+            target_elev = target_elevations[target_idx]
 
-        # 一次性获取批次中所有目标点的KNN邻居
-        # 返回形状: (batch_size, k_search)
-        batch_target_coords = np.column_stack([batch_target_lons, batch_target_lats])
-        _, indices = nbrs.kneighbors(batch_target_coords)
+            # 跳过目标点海拔为NaN的情况
+            if np.isnan(target_elev):
+                continue
 
-        # 使用高级索引提取所有候选点的数据
-        # 形状: (batch_size, k_search)
-        candidate_lons = station_lons[indices]
-        candidate_lats = station_lats[indices]
-        candidate_alts = station_alts[indices]
-        candidate_vis = station_vis[indices]
+            # 获取候选邻居的索引
+            candidate_indices = indices[i]
 
-        # 扩展目标点坐标以匹配候选点维度
-        # 形状: (batch_size, 1) -> 广播到 (batch_size, k_search)
-        target_lons_expanded = batch_target_lons[:, np.newaxis]
-        target_lats_expanded = batch_target_lats[:, np.newaxis]
-        target_elevs_expanded = batch_target_elevs[:, np.newaxis]
+            # 向量化计算：一次性计算到所有候选点的各向异性距离
+            # 提取候选点的坐标和数据
+            candidate_lons = station_lons[candidate_indices]
+            candidate_lats = station_lats[candidate_indices]
+            candidate_alts = station_alts[candidate_indices]
 
-        # 批量计算水平距离（完全向量化）
-        # 形状: (batch_size, k_search)
-        horizontal_dists = deg2km_batch(target_lats_expanded, target_lons_expanded,
-                                       candidate_lats, candidate_lons)
+            # 批量计算水平距离（向量化）
+            horizontal_dists = deg2km_vectorized(target_lat, target_lon,
+                                                 candidate_lats, candidate_lons)
 
-        # 批量计算垂直距离（完全向量化）
-        # 形状: (batch_size, k_search)
-        vertical_dists = np.abs(target_elevs_expanded - candidate_alts) / 1000.0
+            # 批量计算垂直距离（向量化）
+            vertical_dists = np.abs(target_elev - candidate_alts) / 1000.0
 
-        # 批量计算各向异性距离（完全向量化）
-        # 形状: (batch_size, k_search)
-        aniso_dists = np.sqrt(horizontal_dists**2 + (beta * vertical_dists)**2)
+            # 批量计算各向异性距离（向量化）
+            aniso_dists = np.sqrt(horizontal_dists**2 + (beta * vertical_dists)**2)
 
-        # 处理无效情况：目标点海拔为NaN或距离为0
-        # 形状: (batch_size, k_search)
-        valid_mask = (aniso_dists > 0) & (~np.isnan(target_elevs_expanded))
+            # 筛选有效候选点（距离>0，避免除零）
+            valid_mask = aniso_dists > 0
+            valid_dists = aniso_dists[valid_mask]
+            valid_indices = candidate_indices[valid_mask]
 
-        # 将无效距离设为无穷大，确保不被选中
-        aniso_dists_masked = np.where(valid_mask, aniso_dists, np.inf)
+            # 如果有效候选点不足，跳过
+            if len(valid_dists) == 0:
+                continue
 
-        # 对每个目标点，选择最近的n_neighbors个邻居
-        # 使用argpartition快速选择（不完全排序）
-        if k_search > n_neighbors:
-            # 形状: (batch_size, n_neighbors)
-            kth_indices = np.argpartition(aniso_dists_masked, n_neighbors-1, axis=1)[:, :n_neighbors]
-        else:
-            # 如果候选点不足，使用所有候选点
-            kth_indices = np.arange(k_search)[np.newaxis, :].repeat(batch_size_actual, axis=0)
+            # 选择最近的n_neighbors个点
+            if len(valid_dists) >= n_neighbors:
+                # 使用argpartition快速选择最小的n_neighbors个（比完全排序快）
+                kth_indices = np.argpartition(valid_dists, n_neighbors-1)[:n_neighbors]
+                selected_dists = valid_dists[kth_indices]
+                selected_indices = valid_indices[kth_indices]
+            else:
+                # 使用所有可用的点
+                selected_dists = valid_dists
+                selected_indices = valid_indices
 
-        # 使用高级索引提取选中的距离和能见度值
-        # 需要构建行索引
-        row_indices = np.arange(batch_size_actual)[:, np.newaxis]
+            # 计算权重（向量化）
+            weights = 1.0 / (selected_dists ** power)
 
-        # 形状: (batch_size, n_neighbors)
-        selected_dists = aniso_dists_masked[row_indices, kth_indices]
-        selected_vis = candidate_vis[row_indices, kth_indices]
+            # 加权平均（向量化）
+            weighted_vis = np.sum(weights * station_vis[selected_indices])
+            total_weight = np.sum(weights)
 
-        # 计算权重（完全向量化）
-        # 形状: (batch_size, n_neighbors)
-        weights = 1.0 / (selected_dists ** power)
-
-        # 将无效点的权重设为0（距离为inf的点）
-        weights = np.where(np.isfinite(weights), weights, 0.0)
-
-        # 计算每个目标点的加权平均（沿axis=1求和）
-        # 形状: (batch_size,)
-        weighted_vis = np.sum(weights * selected_vis, axis=1)
-        total_weights = np.sum(weights, axis=1)
-
-        # 使用安全除法避免除零警告
-        batch_results = np.full(batch_size_actual, np.nan, dtype=np.float64)
-        valid_results = total_weights > 0
-        np.divide(weighted_vis, total_weights,
-                 out=batch_results,
-                 where=valid_results)
-
-        # 将批次结果写入输出数组
-        interpolated_vis[batch_start:batch_end] = batch_results
-
+            interpolated_vis[target_idx] = weighted_vis / total_weight
+    
     print("插值完成!")
     valid_count = np.sum(~np.isnan(interpolated_vis))
     print(f"成功插值点数: {valid_count}/{n_targets} ({valid_count/n_targets*100:.1f}%)")
-
+    
     return interpolated_vis
 
 def create_visibility_grid(df_station, ds_dem, beta=10.0, power=2.0, n_neighbors=6):
@@ -514,7 +471,7 @@ if __name__ == "__main__":
     end_date = datetime(2025, 10, 11, 0, 0)
 
     # 选择数据源类型: "national" 或 "national_and_regional"
-    source_type = "national_and_regional"
+    source_type = "national"
 
     # 是否启用可视化（会显著增加处理时间）
     enable_visualization = False

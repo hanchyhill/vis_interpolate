@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path, PureWindowsPath
 from typing import Dict
 import warnings
+from os import path
 warnings.filterwarnings('ignore')
 
 
@@ -65,11 +66,18 @@ def build_filenames_and_urls(ts: datetime, province: str = "广东") -> Dict[str
         PureWindowsPath(r"H:\github\python\vis_interpolate\data\idw_nc") / dem_filename
     )
 
+    # nation_vis
+    idw_vis_filename = f"visibility_anisotropic_idw_{YYYY}{MM}{DD}{HH}00.nc"
+    nation_vis_fullpath = Path(path.dirname(__file__)) / f'../data/idw_nc/national' / idw_vis_filename
+    nation_region_vis_fullpath = Path(path.dirname(__file__)) / f'../data/idw_nc/national_and_regional' / idw_vis_filename
+
     return {
         "national":  {"filename": national_filename, "fullpath": national_fullpath},
         "regional":  {"filename": regional_filename, "fullpath": regional_fullpath},
         "cldas_vis": {"filename": vis_filename, "url": vis_url},
         "dem_vis": {"filename": dem_filename, "fullpath": dem_fullpath},
+        "nation_vis": {"filename": idw_vis_filename, "fullpath": nation_vis_fullpath},
+        "nation_region_vis": {"filename": idw_vis_filename, "fullpath": nation_region_vis_fullpath},
     }
 
 
@@ -258,7 +266,7 @@ def load_cached_results(cache_file: Path):
 
 
 def get_vis_score_by_time(time_selected: datetime, fields: list, fields_2: list, field_map: dict,
-                          station_type: str = "national", output_dir: Path = None, use_cache: bool = True):
+                          station_type: str = "national", model_type: str = "national", output_dir: Path = None, use_cache: bool = True):
     """
     根据指定时间，获取能见度预报得分
 
@@ -268,6 +276,7 @@ def get_vis_score_by_time(time_selected: datetime, fields: list, fields_2: list,
         fields_2: list, 区域站字段列表
         field_map: dict, 字段映射字典
         station_type: str, 站点类型 ("national" 或 "regional")
+        model_type: str, 模型类型 ("national" 或 "national_and_regional")
         output_dir: Path, 输出目录（用于检查缓存文件）
         use_cache: bool, 是否使用缓存（默认True）
 
@@ -289,6 +298,8 @@ def get_vis_score_by_time(time_selected: datetime, fields: list, fields_2: list,
     file_path_region = files_selected["regional"]["fullpath"]
     url_path_cldas_vis = files_selected["cldas_vis"]["url"]
     dem_vis_path = files_selected["dem_vis"]["fullpath"]
+    nation_vis_path = files_selected["nation_vis"]["fullpath"]
+    nation_region_vis_path = files_selected["nation_region_vis"]["fullpath"]
 
     try:
         if station_type == "national":
@@ -309,26 +320,38 @@ def get_vis_score_by_time(time_selected: datetime, fields: list, fields_2: list,
         return None, None
 
     # 读取能见度预报数据
-    vis_data = load_visibility_data(dem_vis_path)
+    if model_type == "national":
+        vis_data = load_visibility_data(nation_vis_path)
+    elif model_type == "national_and_regional":
+        vis_data = load_visibility_data(nation_region_vis_path)
+    else:
+        print(f"  ⚠ 未知的模型类型: {model_type}")
+        return None, None
+
+    # vis_data = load_visibility_data(dem_vis_path)
+    
+    # vis_data = load_visibility_data(nation_region_vis_path)
     if vis_data is None:
         return None, None
 
     # 评估能见度预报效果
     results_df, stats = evaluate_visibility_score(vis_data, df_station)
+    # results_df_nation, stats_nation = evaluate_visibility_score(vis_data_nation, df_station)
+    # results_df_nation_region, stats_nation_region = evaluate_visibility_score(vis_data_nation_region, df_station)
+    # results_df, stats, 
+    return results_df, stats,
 
-    return results_df, stats
 
-
-def main():
+def main(model_type: str = "national"):
     """
     主函数：循环检验指定日期范围内的能见度预报
     """
     # 定义日期范围
-    start_date = datetime(2024, 12, 5, 0, 0)
-    end_date = datetime(2024, 12, 5, 0, 0)
+    start_date = datetime(2024, 10, 11, 0, 0)
+    end_date = datetime(2025, 10, 11, 0, 0)
 
     # 定义输出目录
-    output_dir = Path(r"H:\github\python\vis_interpolate\data\dem_model_score")
+    output_dir = Path(r"H:\github\python\vis_interpolate\data\model_score") / model_type
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 定义字段
@@ -394,17 +417,24 @@ def main():
 
         # 执行国家站检验
         print("  [国家站]", end=" ")
-        results_df_national, stats_national = get_vis_score_by_time(
-            current_date, fields, fields_2, field_map,
-            station_type="national", output_dir=output_dir, use_cache=True
-        )
+        detail_file_national = output_dir / f"vis_score_detail_national_{time_str}_model_{model_type}.csv"
+
+        # 先检查详细结果文件是否存在
+        if detail_file_national.exists():
+            # 直接从文件读取，跳过计算
+            results_df_national, stats_national = load_cached_results(detail_file_national)
+            print("[已存在]", end=" ")
+        else:
+            # 文件不存在，进行计算
+            results_df_national, stats_national = get_vis_score_by_time(
+                current_date, fields, fields_2, field_map,
+                station_type="national", model_type=model_type, output_dir=output_dir, use_cache=True
+            )
+            # 保存详细结果
+            if results_df_national is not None and stats_national is not None:
+                results_df_national.to_csv(detail_file_national, index=False, encoding='utf-8-sig')
 
         if results_df_national is not None and stats_national is not None:
-            # 保存详细结果（仅当不是从缓存读取时）
-            detail_file = output_dir / f"vis_score_detail_national_{time_str}_dem_model.csv"
-            if not detail_file.exists():
-                results_df_national.to_csv(detail_file, index=False, encoding='utf-8-sig')
-
             # 添加时间信息到统计结果
             stats_national['datetime'] = current_date
             stats_national['time_str'] = time_str
@@ -418,17 +448,24 @@ def main():
 
         # 执行区域站检验
         print("  [区域站]", end=" ")
-        results_df_regional, stats_regional = get_vis_score_by_time(
-            current_date, fields, fields_2, field_map,
-            station_type="regional", output_dir=output_dir, use_cache=True
-        )
+        detail_file_regional = output_dir / f"vis_score_detail_regional_{time_str}_model_{model_type}.csv"
+
+        # 先检查详细结果文件是否存在
+        if detail_file_regional.exists():
+            # 直接从文件读取，跳过计算
+            results_df_regional, stats_regional = load_cached_results(detail_file_regional)
+            print("[已存在]", end=" ")
+        else:
+            # 文件不存在，进行计算
+            results_df_regional, stats_regional = get_vis_score_by_time(
+                current_date, fields, fields_2, field_map,
+                station_type="regional", model_type=model_type, output_dir=output_dir, use_cache=True
+            )
+            # 保存详细结果
+            if results_df_regional is not None and stats_regional is not None:
+                results_df_regional.to_csv(detail_file_regional, index=False, encoding='utf-8-sig')
 
         if results_df_regional is not None and stats_regional is not None:
-            # 保存详细结果（仅当不是从缓存读取时）
-            detail_file = output_dir / f"vis_score_detail_regional_{time_str}_dem_model.csv"
-            if not detail_file.exists():
-                results_df_regional.to_csv(detail_file, index=False, encoding='utf-8-sig')
-
             # 添加时间信息到统计结果
             stats_regional['datetime'] = current_date
             stats_regional['time_str'] = time_str
@@ -460,7 +497,7 @@ def main():
     # 保存国家站汇总
     if all_stats_national:
         summary_df_national = pd.DataFrame(all_stats_national)
-        summary_file_national = output_dir / "vis_score_summary_nationall_dem_model.csv"
+        summary_file_national = output_dir / f"vis_score_summary_national_model_{model_type}.csv"
         summary_df_national.to_csv(summary_file_national, index=False, encoding='utf-8-sig')
 
         print("\n国家站整体统计 (所有时次平均):")
@@ -477,7 +514,12 @@ def main():
     # 保存区域站汇总
     if all_stats_regional:
         summary_df_regional = pd.DataFrame(all_stats_regional)
-        summary_file_regional = output_dir / "vis_score_summary_regional_dem_model.csv"
+        # 将 'datetime', 'time_str', 'station_type' 排到前三列（如果存在）
+        priority_cols = ['datetime', 'time_str', 'station_type']
+        cols = [col for col in priority_cols if col in summary_df_regional.columns] + \
+               [col for col in summary_df_regional.columns if col not in priority_cols]
+        summary_df_regional = summary_df_regional[cols]
+        summary_file_regional = output_dir / f"vis_score_summary_regional_model_{model_type}.csv"
         summary_df_regional.to_csv(summary_file_regional, index=False, encoding='utf-8-sig')
 
         print("\n区域站整体统计 (所有时次平均):")
@@ -496,4 +538,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(model_type="national")
+    main(model_type="national_and_regional")
