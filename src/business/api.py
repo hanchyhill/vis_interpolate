@@ -57,8 +57,22 @@ class VisibilityApiClient:
         for province in self.settings.requested_provinces():
             national_text, national_marker = self._request(NATIONAL_INTERFACE, timestamp, province)
             regional_text, regional_marker = self._request(REGIONAL_INTERFACE, timestamp, province)
-            national_frames.append(_parse_response(national_text, _NATIONAL_FIELDS, "V20001"))
-            regional_frames.append(_parse_response(regional_text, _REGIONAL_FIELDS, "V20001_701_01"))
+            national_frames.append(
+                _parse_response(
+                    national_text,
+                    _NATIONAL_FIELDS,
+                    "V20001",
+                    fallback_visibility_fields=("V20001_701_01",),
+                )
+            )
+            regional_frames.append(
+                _parse_response(
+                    regional_text,
+                    _REGIONAL_FIELDS,
+                    "V20001_701_01",
+                    fallback_visibility_fields=("V20001",),
+                )
+            )
             national_markers.append(national_marker)
             regional_markers.append(regional_marker)
         if not national_frames or not regional_frames:
@@ -126,7 +140,12 @@ def _response_marker(text: str) -> int | None:
     return None
 
 
-def _parse_response(text: str, fields: list[str], visibility_field: str) -> pd.DataFrame:
+def _parse_response(
+    text: str,
+    fields: list[str],
+    visibility_field: str,
+    fallback_visibility_fields: tuple[str, ...] = (),
+) -> pd.DataFrame:
     lines = [line for line in text.splitlines() if line.strip()]
     if len(lines) < 2:
         raise ValueError("接口响应缺少数量行或CSV表头")
@@ -143,6 +162,13 @@ def _parse_response(text: str, fields: list[str], visibility_field: str) -> pd.D
         raise ValueError(f"接口CSV缺少字段: {', '.join(missing)}")
 
     selected = frame[fields].copy()
+    # 部分时次主能见度字段会整列缺测，但同一响应仍提供另一种能见度产品；
+    # 仅对主字段缺测的行回退，主字段有效值保持不变。
+    visibility = frame[visibility_field].copy()
+    for fallback_field in fallback_visibility_fields:
+        if fallback_field in frame.columns:
+            visibility = visibility.fillna(frame[fallback_field])
+    selected[visibility_field] = visibility
     if "D_UPDATE_TIME" in frame.columns:
         selected["_update_time"] = pd.to_datetime(
             frame["D_UPDATE_TIME"], format="mixed", errors="coerce"

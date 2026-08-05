@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,7 +44,7 @@ class BusinessConfig:
     nc_combined_root: Path
     vis_img_root: Path = Path("data/vis_img")
     guangdong_boundary_path: Path = Path(
-        r"D:\Document\气象台\GIS\ChinaAdminDivisonSHP-master\中国省市县和乡镇行政区划\广东省\广东省_省界.shp"
+        "data/assets/gis/guangdong/广东省_省界.shp"
     )
     schedule_minutes: tuple[int, ...] = field(
         default=(2, 7, 12, 17, 22, 27, 32, 37, 42, 47, 52, 57)
@@ -65,7 +66,7 @@ class BusinessConfig:
         credential_path = (
             Path(configured_path)
             if configured_path
-            else root / "src" / "config" / "local.config.json"
+            else _default_config_path(root)
         )
         if not credential_path.is_absolute():
             credential_path = (root / credential_path).resolve()
@@ -102,9 +103,9 @@ class BusinessConfig:
             retries=max(1, int(values.get("retries", 3))),
         )
         data_root = _resolve_path(values.get("dataRoot", "data"), root)
-        default_dem = _resolve_path(r"h:\data\DEM\merged_dem_data.nc", root)
+        default_dem = _resolve_path("data/assets/dem/merged_dem_data.nc", root)
         default_boundary = _resolve_path(
-            r"D:\Document\气象台\GIS\ChinaAdminDivisonSHP-master\中国省市县和乡镇行政区划\广东省\广东省_省界.shp",
+            "data/assets/gis/guangdong/广东省_省界.shp",
             root,
         )
         selected_dem = _resolve_path(dem_path, root) if dem_path else _resolve_path(
@@ -137,6 +138,12 @@ def _normalize_provinces(value: str | tuple[str, ...] | list[str]) -> tuple[str,
     if not result:
         raise ValueError("省份列表不能为空")
     return result
+
+
+def _default_config_path(root: Path) -> Path:
+    """根据运行平台选择默认配置文件。"""
+    filename = "local.config.json" if platform.system() == "Windows" else "server.config.json"
+    return root / "src" / "config" / filename
 
 
 def _resolve_path(value: str | Path, base: Path) -> Path:

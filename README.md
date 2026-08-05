@@ -378,6 +378,17 @@ pm2 save
 - 估算CSV：由 `csvNationalRoot`、`csvCombinedRoot` 配置，默认位于 `data/vis_estimated_base_nation_station/YYYY/MM/DD/`、`data/vis_estimated_base_nation_and_regional_station/YYYY/MM/DD/`。
 - IDW NetCDF：由 `ncNationalRoot`、`ncCombinedRoot` 配置，默认位于 `data/idw_nc/national/YYYY/MM/DD/`、`data/idw_nc/national_and_regional/YYYY/MM/DD/`。
 - 广东省遮罩图片：由 `visImgRoot` 配置，默认位于 `data/vis_img/YYYY/MM/DD/`，文件名为 `visibility_national_*.png` 和 `visibility_national_and_regional_*.png`。
+
+如需只对已有NetCDF重新绘图，可直接运行绘图模块：
+
+```bash
+uv run python -m src.business.plot \
+  --nc data/idw_nc/national/2026/08/05/visibility_anisotropic_idw_202608050800.nc \
+  --boundary D:/vis_interpolate/data/boundary/广东省_省界.shp \
+  --output data/vis_img/2026/08/05/visibility_national_202608050800.png
+```
+
+如果配置的 `guangdongBoundaryPath` 不存在，业务数据仍会正常输出，但该资料时次会在日志中提示未生成图片；服务器部署时应把该边界文件路径配置正确。
 - 样本计数、锁文件和运行日志：分别由 `statePath`、`lockPath`、`logPath` 配置。
 
 常驻调度在每小时 `02、07、12、17、22、27、32、37、42、47、52、57` 分启动；每轮扫描世界时前30分钟内且距当前至少5分钟的5分钟资料时次。业务状态保存在 `data/business/pipeline_state.sqlite`，运行日志保存在 `data/business/business.log`。输出文件按 `YYYY/MM/DD` 分层保存到两个估算CSV目录和 `data/idw_nc/national`、`data/idw_nc/national_and_regional` 目录。

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -36,6 +37,16 @@ class BusinessPipelineTests(unittest.TestCase):
         self.assertEqual(len(frame), 1)
         self.assertEqual(frame.iloc[0]["code"], "N1")
         self.assertEqual(frame.iloc[0]["vis"], 1000)
+
+    def test_api_parser_falls_back_when_primary_visibility_is_missing(self) -> None:
+        text = "1\nV01301,VF01015_CN,V_CITY,V_COUNTY,V06001,V05001,V07001,V13003,V20001,V20001_701_01\nN1,站1,广州,县,113,23,10,80,9999,25000\n"
+        frame = _parse_response(
+            text,
+            ["V01301", "VF01015_CN", "V_CITY", "V_COUNTY", "V06001", "V05001", "V07001", "V13003", "V20001"],
+            "V20001",
+            fallback_visibility_fields=("V20001_701_01",),
+        )
+        self.assertEqual(frame.iloc[0]["vis"], 25000)
 
     def test_api_client_queries_and_merges_all_six_provinces(self) -> None:
         calls = []
@@ -81,6 +92,28 @@ class BusinessPipelineTests(unittest.TestCase):
             self.assertEqual(config.csv_national_root, (root / "server-data/csv-national").resolve())
             self.assertEqual(config.log_path, (root / "server-data/logs/business.log").resolve())
             self.assertEqual(config.nc_national_root, (root / "server-data/idw_nc/national").resolve())
+
+    def test_default_config_follows_platform(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_dir = root / "src" / "config"
+            config_dir.mkdir(parents=True)
+            (config_dir / "local.config.json").write_text(
+                json.dumps({"userId": "windows-user", "pwd": "p"}),
+                encoding="utf-8",
+            )
+            (config_dir / "server.config.json").write_text(
+                json.dumps({"userId": "linux-user", "pwd": "p"}),
+                encoding="utf-8",
+            )
+
+            with patch("src.business.config.platform.system", return_value="Windows"):
+                windows_config = BusinessConfig.from_file(repo_root=root)
+            with patch("src.business.config.platform.system", return_value="Linux"):
+                linux_config = BusinessConfig.from_file(repo_root=root)
+
+            self.assertEqual(windows_config.api.user_id, "windows-user")
+            self.assertEqual(linux_config.api.user_id, "linux-user")
 
     def test_window_is_five_minute_aligned_and_excludes_recent_data(self) -> None:
         now = datetime(2026, 8, 5, 8, 2, tzinfo=timezone.utc)
@@ -178,6 +211,23 @@ class BusinessPipelineTests(unittest.TestCase):
                     {"elevation": (("lat", "lon"), np.ones((2, 2)) * 10)},
                     coords={"lat": [23.0, 24.0], "lon": [113.0, 114.0]},
                 ).to_netcdf(dem_path)
+                boundary_path = root / "guangdong.geojson"
+                boundary_path.write_text(
+                    json.dumps(
+                        {
+                            "type": "FeatureCollection",
+                            "features": [{
+                                "type": "Feature",
+                                "properties": {},
+                                "geometry": {
+                                    "type": "Polygon",
+                                    "coordinates": [[[112.9, 22.9], [114.1, 22.9], [114.1, 24.1], [112.9, 24.1], [112.9, 22.9]]],
+                                },
+                            }],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
                 data = root / "data"
                 config = BusinessConfig(
                     repo_root=root,
@@ -191,7 +241,7 @@ class BusinessPipelineTests(unittest.TestCase):
                     nc_national_root=data / "nc-national",
                     nc_combined_root=data / "nc-combined",
                     vis_img_root=data / "vis-img",
-                    guangdong_boundary_path=root / "missing.shp",
+                    guangdong_boundary_path=boundary_path,
                 )
                 timestamp = datetime(2026, 8, 5, 8, 2, tzinfo=timezone.utc)
                 first = run_once(timestamp, config)
@@ -200,6 +250,7 @@ class BusinessPipelineTests(unittest.TestCase):
                 self.assertEqual(len(list((data / "csv-combined").rglob("*.csv"))), 5)
                 self.assertEqual(len(list((data / "nc-national").rglob("*.nc"))), 5)
                 self.assertEqual(len(list((data / "nc-combined").rglob("*.nc"))), 5)
+                self.assertEqual(len(list((data / "vis-img").rglob("*.png"))), 10)
                 close_logging()
                 second = run_once(timestamp, config)
                 self.assertEqual(sum(item["status"] == "skipped" for item in second), 5)

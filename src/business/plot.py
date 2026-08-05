@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import argparse
 
 import cartopy.crs as ccrs
 import geopandas as gpd
@@ -10,10 +11,31 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 import numpy as np
 import xarray as xr
-from matplotlib.colors import BoundaryNorm, LinearSegmentedColormap
+from matplotlib.colors import LinearSegmentedColormap, Normalize
 from shapely import contains_xy
+
+
+def _configure_fonts() -> None:
+    """优先选择系统中文字体，避免省名和色标中文变成DejaVu缺字警告。"""
+    candidates = ("SimHei", "Microsoft YaHei", "Noto Sans SC", "STHeiti", "Arial Unicode MS")
+    selected = None
+    for name in candidates:
+        try:
+            font_manager.findfont(
+                font_manager.FontProperties(family=name), fallback_to_default=False
+            )
+            selected = name
+            break
+        except (FileNotFoundError, ValueError):
+            continue
+    plt.rcParams["font.sans-serif"] = [selected or "DejaVu Sans"]
+    plt.rcParams["axes.unicode_minus"] = False
+
+
+_configure_fonts()
 
 
 def load_guangdong_boundary(path: Path) -> gpd.GeoDataFrame:
@@ -56,11 +78,9 @@ def plot_visibility(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     cmap = _visibility_colormap()
-    norm = BoundaryNorm(
-        [0, 0.05, 0.2, 0.5, 1, 2, 5, 10, 15, 20, 30],
-        ncolors=cmap.N,
-        clip=True,
-    )
+    # 保留原有低能见度红色、高能见度蓝色的色系，但使用连续归一化，
+    # 避免BoundaryNorm造成分段跳色，使图面和色标均为平滑渐变。
+    norm = Normalize(vmin=0, vmax=30, clip=True)
     fig = plt.figure(figsize=(12, 9))
     ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
     image = masked.plot.pcolormesh(
@@ -71,7 +91,13 @@ def plot_visibility(
         add_colorbar=False,
         shading="auto",
     )
-    boundary.plot(ax=ax, facecolor="none", edgecolor="black", linewidth=1.5)
+    boundary.plot(
+        ax=ax,
+        facecolor="none",
+        edgecolor="black",
+        linewidth=1.5,
+        transform=ccrs.PlateCarree(),
+    )
     bounds = boundary.total_bounds
     ax.set_extent([bounds[0] - 0.2, bounds[2] + 0.2, bounds[1] - 0.2, bounds[3] + 0.2], ccrs.PlateCarree())
     gridlines = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5)
@@ -91,3 +117,16 @@ def _visibility_colormap() -> LinearSegmentedColormap:
         "#ADFF2F", "#32CD32", "#00CED1", "#00BFFF", "#87CEEB", "#F0F8FF",
     ]
     return LinearSegmentedColormap.from_list("visibility_business", colors, N=256)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="对已有能见度IDW NetCDF绘制广东省遮罩图")
+    parser.add_argument("--nc", required=True, type=Path, help="输入IDW NetCDF路径")
+    parser.add_argument("--boundary", required=True, type=Path, help="广东省边界Shapefile/GeoJSON路径")
+    parser.add_argument("--output", required=True, type=Path, help="输出PNG路径")
+    args = parser.parse_args()
+    plot_visibility(args.nc, args.boundary, args.output)
+
+
+if __name__ == "__main__":
+    main()

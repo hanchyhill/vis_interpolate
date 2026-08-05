@@ -4,6 +4,9 @@ const root = __dirname;
 const python = process.platform === 'win32'
   ? path.join(root, '.venv', 'Scripts', 'python.exe')
   : path.join(root, '.venv', 'bin', 'python');
+const defaultConfig = process.platform === 'win32'
+  ? path.join(root, 'src', 'config', 'local.config.json')
+  : path.join(root, 'src', 'config', 'server.config.json');
 
 module.exports = {
   apps: [
@@ -26,7 +29,7 @@ module.exports = {
       env: {
         PYTHONUTF8: '1',
         VIS_BUSINESS_CONFIG: process.env.VIS_BUSINESS_CONFIG
-          || path.join(root, 'src', 'config', 'local.config.json'),
+          || defaultConfig,
       },
     },
   ],

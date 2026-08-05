@@ -47,3 +47,9 @@ YYYY/MM/DD/
 | ⑤ 模型评估 | `src/evaluate_visibility_model.py` | IDW 结果 vs CLDAS 产品 → 评分 CSV |
 
 本次流程只需要环节②能见度估算和③IDW 插值的改造。
+
+## 任务，识别不同平台，加载不同的配置文件
+@src\business\config.py
+当在Windows平台运行时，使用配置 @src\config\local.config.json
+当在linux平台运行时，使用配置 @src\config\server.config.json
+另外，在 pm2配置中，由于服务器在linux当中，默认使用的是server.config.json @ecosystem.config.cjs
