@@ -249,3 +249,5 @@ data/
 *.png
 *.jpg
 *.pptx
+local.config.json
+server.config.json

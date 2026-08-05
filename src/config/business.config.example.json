@@ -1,0 +1,19 @@
+{
+  "userId": "username",
+  "pwd": "password",
+  "baseUrl": "http://172.22.1.175/di/http.action",
+  "provinces": ["广东", "广西", "湖南", "江西", "福建", "海南"],
+  "dataRoot": "D:/vis_interpolate/data",
+  "demPath": "D:/vis_interpolate/data/DEM/merged_dem_data.nc",
+  "csvNationalRoot": "vis_estimated_base_nation_station",
+  "csvCombinedRoot": "vis_estimated_base_nation_and_regional_station",
+  "ncNationalRoot": "idw_nc/national",
+  "ncCombinedRoot": "idw_nc/national_and_regional",
+  "visImgRoot": "vis_img",
+  "guangdongBoundaryPath": "D:/vis_interpolate/data/boundary/广东省_省界.shp",
+  "statePath": "business/pipeline_state.sqlite",
+  "lockPath": "business/pipeline.lock",
+  "logPath": "business/business.log",
+  "timeoutSeconds": 60,
+  "retries": 3
+}

@@ -8,9 +8,10 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path, PureWindowsPath
-from typing import Dict
+from typing import Dict, Tuple, Optional
 import warnings
-from os import path
+from os import path, cpu_count
+from multiprocessing import Pool
 warnings.filterwarnings('ignore')
 
 
@@ -342,6 +343,89 @@ def get_vis_score_by_time(time_selected: datetime, fields: list, fields_2: list,
     return results_df, stats,
 
 
+def process_single_time(args: Tuple) -> Dict:
+    """
+    处理单个时次的国家站和区域站检验（用于多进程）
+
+    参数:
+        args: tuple, 包含 (current_date, fields, fields_2, field_map, model_type, output_dir, time_index, total_hours)
+
+    返回:
+        result: dict, 包含处理结果和统计信息
+    """
+    current_date, fields, fields_2, field_map, model_type, output_dir, time_index, total_hours = args
+    time_str = current_date.strftime('%Y%m%d%H')
+
+    # 输出开始处理信息（带进程标识）
+    print(f"[进程 {time_index}] 开始处理: {current_date.strftime('%Y-%m-%d %H:%M')}")
+
+    result = {
+        'time_str': time_str,
+        'datetime': current_date,
+        'time_index': time_index,
+        'total_hours': total_hours,
+        'national': {'results_df': None, 'stats': None, 'status': 'failed'},
+        'regional': {'results_df': None, 'stats': None, 'status': 'failed'}
+    }
+
+    # 处理国家站检验
+    detail_file_national = output_dir / f"vis_score_detail_national_{time_str}_model_{model_type}.csv"
+
+    if detail_file_national.exists():
+        # 直接从文件读取
+        results_df_national, stats_national = load_cached_results(detail_file_national)
+        result['national']['status'] = 'cached' if results_df_national is not None else 'failed'
+    else:
+        # 文件不存在，进行计算
+        results_df_national, stats_national = get_vis_score_by_time(
+            current_date, fields, fields_2, field_map,
+            station_type="national", model_type=model_type, output_dir=output_dir, use_cache=True
+        )
+        # 保存详细结果
+        if results_df_national is not None and stats_national is not None:
+            results_df_national.to_csv(detail_file_national, index=False, encoding='utf-8-sig')
+            result['national']['status'] = 'computed'
+        else:
+            result['national']['status'] = 'failed'
+
+    if results_df_national is not None and stats_national is not None:
+        # 添加时间信息到统计结果
+        stats_national['datetime'] = current_date
+        stats_national['time_str'] = time_str
+        stats_national['station_type'] = 'national'
+        result['national']['stats'] = stats_national
+
+    # 处理区域站检验
+    detail_file_regional = output_dir / f"vis_score_detail_regional_{time_str}_model_{model_type}.csv"
+
+    if detail_file_regional.exists():
+        # 直接从文件读取
+        results_df_regional, stats_regional = load_cached_results(detail_file_regional)
+        result['regional']['status'] = 'cached' if results_df_regional is not None else 'failed'
+    else:
+        # 文件不存在，进行计算
+        results_df_regional, stats_regional = get_vis_score_by_time(
+            current_date, fields, fields_2, field_map,
+            station_type="regional", model_type=model_type, output_dir=output_dir, use_cache=True
+        )
+        # 保存详细结果
+        if results_df_regional is not None and stats_regional is not None:
+            results_df_regional.to_csv(detail_file_regional, index=False, encoding='utf-8-sig')
+            result['regional']['status'] = 'computed'
+        else:
+            result['regional']['status'] = 'failed'
+
+    if results_df_regional is not None and stats_regional is not None:
+        # 添加时间信息到统计结果
+        stats_regional['datetime'] = current_date
+        stats_regional['time_str'] = time_str
+        stats_regional['station_type'] = 'regional'
+        result['regional']['stats'] = stats_regional
+
+    print(f"[进程 {time_index}] 完成处理: {current_date.strftime('%Y-%m-%d %H:%M')}")
+    return result
+
+
 def main(model_type: str = "national"):
     """
     主函数：循环检验指定日期范围内的能见度预报
@@ -398,92 +482,85 @@ def main(model_type: str = "national"):
     all_stats_regional = []
 
     # 时间循环
-    current_date = start_date
-    total_hours = int((end_date - start_date).total_seconds() / 3600)
+    total_hours = int((end_date - start_date).total_seconds() / 3600) + 1
     processed_national = 0
     processed_regional = 0
     skipped = 0
 
     print("=" * 80)
-    print(f"能见度预报检验 (国家站 + 区域站)")
+    print(f"能见度预报检验 (国家站 + 区域站) - 多进程模式")
     print(f"起始时间: {start_date.strftime('%Y-%m-%d %H:%M')}")
     print(f"结束时间: {end_date.strftime('%Y-%m-%d %H:%M')}")
     print(f"总时次数: {total_hours}")
+
+    # 配置进程数
+    num_processes = max(1, cpu_count() - 1)
+    print(f"进程数: {num_processes} (CPU核心数-1)")
     print("=" * 80)
 
+    # 准备所有时次的参数
+    time_args = []
+    current_date = start_date
+    time_index = 0
     while current_date <= end_date:
-        time_str = current_date.strftime('%Y%m%d%H')
-        print(f"\n处理时次: {current_date.strftime('%Y-%m-%d %H:%M')} ({processed_national + processed_regional // 2 + skipped + 1}/{total_hours})")
+        time_args.append((
+            current_date, fields, fields_2, field_map,
+            model_type, output_dir, time_index, total_hours
+        ))
+        current_date += timedelta(hours=1)
+        time_index += 1
 
-        # 执行国家站检验
-        print("  [国家站]", end=" ")
-        detail_file_national = output_dir / f"vis_score_detail_national_{time_str}_model_{model_type}.csv"
+    # 使用多进程处理
+    print(f"\n开始并行处理 {len(time_args)} 个时次...")
+    with Pool(processes=num_processes) as pool:
+        results = pool.map(process_single_time, time_args)
 
-        # 先检查详细结果文件是否存在
-        if detail_file_national.exists():
-            # 直接从文件读取，跳过计算
-            results_df_national, stats_national = load_cached_results(detail_file_national)
-            print("[已存在]", end=" ")
+    # 收集结果并输出
+    print("\n" + "=" * 80)
+    print("处理结果汇总:")
+    print("=" * 80)
+
+    for result in sorted(results, key=lambda x: x['datetime']):
+        time_str = result['time_str']
+        print(f"\n时次: {result['datetime'].strftime('%Y-%m-%d %H:%M')} ({result['time_index'] + 1}/{result['total_hours']})")
+
+        # 国家站结果
+        nat_status = result['national']['status']
+        if nat_status == 'cached':
+            print(f"  [国家站] [已存在]", end=" ")
+        elif nat_status == 'computed':
+            print(f"  [国家站]", end=" ")
         else:
-            # 文件不存在，进行计算
-            results_df_national, stats_national = get_vis_score_by_time(
-                current_date, fields, fields_2, field_map,
-                station_type="national", model_type=model_type, output_dir=output_dir, use_cache=True
-            )
-            # 保存详细结果
-            if results_df_national is not None and stats_national is not None:
-                results_df_national.to_csv(detail_file_national, index=False, encoding='utf-8-sig')
+            print(f"  [国家站]", end=" ")
 
-        if results_df_national is not None and stats_national is not None:
-            # 添加时间信息到统计结果
-            stats_national['datetime'] = current_date
-            stats_national['time_str'] = time_str
-            stats_national['station_type'] = 'national'
-            all_stats_national.append(stats_national)
-
-            print(f"✓ 样本数: {stats_national['n_stations']} | MAE: {stats_national['mae']:.2f} km | RMSE: {stats_national['rmse']:.2f} km | R: {stats_national['correlation']:.4f}")
+        if result['national']['stats'] is not None:
+            stats = result['national']['stats']
+            all_stats_national.append(stats)
+            print(f"✓ 样本数: {stats['n_stations']} | MAE: {stats['mae']:.2f} km | RMSE: {stats['rmse']:.2f} km | R: {stats['correlation']:.4f}")
             processed_national += 1
         else:
             print("✗ 数据不可用")
 
-        # 执行区域站检验
-        print("  [区域站]", end=" ")
-        detail_file_regional = output_dir / f"vis_score_detail_regional_{time_str}_model_{model_type}.csv"
-
-        # 先检查详细结果文件是否存在
-        if detail_file_regional.exists():
-            # 直接从文件读取，跳过计算
-            results_df_regional, stats_regional = load_cached_results(detail_file_regional)
-            print("[已存在]", end=" ")
+        # 区域站结果
+        reg_status = result['regional']['status']
+        if reg_status == 'cached':
+            print(f"  [区域站] [已存在]", end=" ")
+        elif reg_status == 'computed':
+            print(f"  [区域站]", end=" ")
         else:
-            # 文件不存在，进行计算
-            results_df_regional, stats_regional = get_vis_score_by_time(
-                current_date, fields, fields_2, field_map,
-                station_type="regional", model_type=model_type, output_dir=output_dir, use_cache=True
-            )
-            # 保存详细结果
-            if results_df_regional is not None and stats_regional is not None:
-                results_df_regional.to_csv(detail_file_regional, index=False, encoding='utf-8-sig')
+            print(f"  [区域站]", end=" ")
 
-        if results_df_regional is not None and stats_regional is not None:
-            # 添加时间信息到统计结果
-            stats_regional['datetime'] = current_date
-            stats_regional['time_str'] = time_str
-            stats_regional['station_type'] = 'regional'
-            all_stats_regional.append(stats_regional)
-
-            print(f"✓ 样本数: {stats_regional['n_stations']} | MAE: {stats_regional['mae']:.2f} km | RMSE: {stats_regional['rmse']:.2f} km | R: {stats_regional['correlation']:.4f}")
+        if result['regional']['stats'] is not None:
+            stats = result['regional']['stats']
+            all_stats_regional.append(stats)
+            print(f"✓ 样本数: {stats['n_stations']} | MAE: {stats['mae']:.2f} km | RMSE: {stats['rmse']:.2f} km | R: {stats['correlation']:.4f}")
             processed_regional += 1
         else:
             print("✗ 数据不可用")
 
-        # 如果国家站和区域站都失败，计数跳过
-        if (results_df_national is None or stats_national is None) and \
-           (results_df_regional is None or stats_regional is None):
+        # 统计跳过
+        if result['national']['stats'] is None and result['regional']['stats'] is None:
             skipped += 1
-
-        # 移动到下一个时次（每小时）
-        current_date += timedelta(hours=1)
 
     # 保存汇总统计结果
     print("\n" + "=" * 80)

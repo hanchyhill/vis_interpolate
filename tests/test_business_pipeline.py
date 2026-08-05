@@ -1,0 +1,240 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+from src.business.algorithms import estimate_both
+from src.business.api import NATIONAL_INTERFACE, REGIONAL_INTERFACE, VisibilityApiClient, _parse_response
+from src.business.config import DEFAULT_PROVINCES, ApiSettings, BusinessConfig
+from src.business.idw import create_visibility_grid
+from src.business.plot import plot_visibility
+from src.business.pipeline import close_logging, run_once, window_times
+from src.business.state import PipelineState, process_lock
+
+
+class BusinessPipelineTests(unittest.TestCase):
+    def setUp(self) -> None:
+        close_logging()
+
+    def tearDown(self) -> None:
+        close_logging()
+
+    def test_api_response_parser_skips_count_line_and_normalizes_fields(self) -> None:
+        text = "2\n\"V01301\",\"VF01015_CN\",\"V_CITY\",\"V_COUNTY\",\"V06001\",\"V05001\",\"V07001\",\"V13003\",\"V20001\"\n\"N1\",\"站1\",\"广州\",\"县\",113,23,10,80,1000\n\"N1\",\"站1\",\"广州\",\"县\",113,23,10,80,9999\n"
+        frame = _parse_response(
+            text,
+            ["V01301", "VF01015_CN", "V_CITY", "V_COUNTY", "V06001", "V05001", "V07001", "V13003", "V20001"],
+            "V20001",
+        )
+        self.assertEqual(len(frame), 1)
+        self.assertEqual(frame.iloc[0]["code"], "N1")
+        self.assertEqual(frame.iloc[0]["vis"], 1000)
+
+    def test_api_client_queries_and_merges_all_six_provinces(self) -> None:
+        calls = []
+
+        class FakeClient(VisibilityApiClient):
+            def _request(self, interface_id, timestamp, province):
+                calls.append((interface_id, province))
+                if interface_id == NATIONAL_INTERFACE:
+                    return _api_csv("V20001", f"N-{province}", 1000), 1
+                return _api_csv("V20001_701_01", f"R-{province}", 2000), 1
+
+        client = FakeClient(ApiSettings(user_id="u", password="p"))
+        batch = client.fetch(datetime(2026, 8, 5, 8, 0, tzinfo=timezone.utc))
+        self.assertEqual(client.settings.requested_provinces(), DEFAULT_PROVINCES)
+        self.assertEqual(len(calls), len(DEFAULT_PROVINCES) * 2)
+        self.assertEqual(len(batch.national), len(DEFAULT_PROVINCES))
+        self.assertEqual(len(batch.regional), len(DEFAULT_PROVINCES))
+        self.assertEqual(batch.marker_counts, {"national": 6, "regional": 6})
+
+    def test_province_override_accepts_chinese_comma(self) -> None:
+        config = BusinessConfig.from_file(provinces="广东，广西")
+        self.assertEqual(config.api.requested_provinces(), ("广东", "广西"))
+
+    def test_json_config_controls_data_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "business.config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "userId": "u",
+                        "pwd": "p",
+                        "dataRoot": "server-data",
+                        "demPath": "dem/merged_dem_data.nc",
+                        "csvNationalRoot": "csv-national",
+                        "logPath": "logs/business.log",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = BusinessConfig.from_file(config_path, repo_root=root)
+            self.assertEqual(config.dem_path, (root / "dem/merged_dem_data.nc").resolve())
+            self.assertEqual(config.csv_national_root, (root / "server-data/csv-national").resolve())
+            self.assertEqual(config.log_path, (root / "server-data/logs/business.log").resolve())
+            self.assertEqual(config.nc_national_root, (root / "server-data/idw_nc/national").resolve())
+
+    def test_window_is_five_minute_aligned_and_excludes_recent_data(self) -> None:
+        now = datetime(2026, 8, 5, 8, 2, tzinfo=timezone.utc)
+        self.assertEqual(
+            [item.strftime("%H:%M") for item in window_times(now)],
+            ["07:35", "07:40", "07:45", "07:50", "07:55"],
+        )
+
+    def test_state_reprocesses_only_when_count_increases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = PipelineState(Path(directory) / "state.sqlite")
+            timestamp = datetime(2026, 8, 5, 8, 0, tzinfo=timezone.utc)
+            counts = {"national_valid": 2, "regional_valid_rh": 3, "regional_valid_vis": 1}
+            self.assertTrue(state.should_process(timestamp, counts))
+            state.success(timestamp, counts, [])
+            self.assertFalse(state.should_process(timestamp, counts))
+            self.assertTrue(state.should_process(timestamp, {**counts, "regional_valid_vis": 2}))
+
+    def test_two_estimation_paths_have_different_reference_data(self) -> None:
+        national = _national_frame()
+        regional = _regional_frame()
+        outputs = estimate_both(national, regional)
+        self.assertEqual(outputs["national"].query("code == 'R1'").iloc[0]["is_vis_est"], 1)
+        combined_r1 = outputs["national_and_regional"].query("code == 'R1'").iloc[0]
+        self.assertEqual(combined_r1["vis"], 3000)
+        self.assertEqual(combined_r1["is_vis_est"], 0)
+
+    def test_idw_returns_meter_units(self) -> None:
+        dem = xr.Dataset(
+            {"elevation": (("lat", "lon"), np.ones((2, 2)) * 10)},
+            coords={"lat": [23.0, 24.0], "lon": [113.0, 114.0]},
+        )
+        result = create_visibility_grid(_national_frame(), dem)
+        self.assertEqual(result.attrs["units"], "m")
+        self.assertEqual(result.shape, (2, 2))
+        self.assertTrue(np.isfinite(result.values).any())
+
+    def test_plot_masks_to_guangdong_boundary_and_saves_png(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            boundary_path = root / "guangdong.geojson"
+            boundary_path.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [{
+                            "type": "Feature",
+                            "properties": {},
+                            "geometry": {
+                                "type": "Polygon",
+                                "coordinates": [[[113, 23], [114, 23], [114, 24], [113, 24], [113, 23]]],
+                            },
+                        }],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            nc_path = root / "visibility.nc"
+            xr.Dataset(
+                {"visibility": (("lat", "lon"), np.ones((3, 3)) * 1000)},
+                coords={"lat": [22.5, 23.5, 24.5], "lon": [112.5, 113.5, 114.5]},
+            ).to_netcdf(nc_path)
+            output = plot_visibility(nc_path, boundary_path, root / "images" / "result.png")
+            self.assertTrue(output.exists())
+            self.assertGreater(output.stat().st_size, 0)
+
+    def test_file_lock_skips_second_holder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pipeline.lock"
+            with process_lock(path) as first:
+                self.assertTrue(first)
+                with process_lock(path) as second:
+                    self.assertFalse(second)
+
+    def test_run_once_publishes_four_outputs_and_same_counts_skip(self) -> None:
+        import src.business.pipeline as pipeline
+        from src.business.api import StationBatch
+
+        batch = StationBatch(_national_frame(), _regional_frame(), {"national": 2, "regional": 2})
+        original_client = pipeline.VisibilityApiClient
+
+        class FakeClient:
+            def __init__(self, settings):
+                pass
+
+            def fetch(self, timestamp):
+                return batch
+
+        pipeline.VisibilityApiClient = FakeClient
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                dem_path = root / "dem.nc"
+                xr.Dataset(
+                    {"elevation": (("lat", "lon"), np.ones((2, 2)) * 10)},
+                    coords={"lat": [23.0, 24.0], "lon": [113.0, 114.0]},
+                ).to_netcdf(dem_path)
+                data = root / "data"
+                config = BusinessConfig(
+                    repo_root=root,
+                    api=ApiSettings(user_id="u", password="p"),
+                    dem_path=dem_path,
+                    state_path=data / "business" / "state.sqlite",
+                    lock_path=data / "business" / "pipeline.lock",
+                    log_path=data / "business" / "business.log",
+                    csv_national_root=data / "csv-national",
+                    csv_combined_root=data / "csv-combined",
+                    nc_national_root=data / "nc-national",
+                    nc_combined_root=data / "nc-combined",
+                    vis_img_root=data / "vis-img",
+                    guangdong_boundary_path=root / "missing.shp",
+                )
+                timestamp = datetime(2026, 8, 5, 8, 2, tzinfo=timezone.utc)
+                first = run_once(timestamp, config)
+                self.assertEqual(sum(item["status"] == "success" for item in first), 5)
+                self.assertEqual(len(list((data / "csv-national").rglob("*.csv"))), 5)
+                self.assertEqual(len(list((data / "csv-combined").rglob("*.csv"))), 5)
+                self.assertEqual(len(list((data / "nc-national").rglob("*.nc"))), 5)
+                self.assertEqual(len(list((data / "nc-combined").rglob("*.nc"))), 5)
+                close_logging()
+                second = run_once(timestamp, config)
+                self.assertEqual(sum(item["status"] == "skipped" for item in second), 5)
+                close_logging()
+        finally:
+            close_logging()
+            pipeline.VisibilityApiClient = original_client
+
+
+def _national_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "code": ["N1", "N2"], "name": ["n1", "n2"], "city": ["c", "c"], "county": ["x", "x"],
+            "lon": [113.0, 114.0], "lat": [23.0, 24.0], "altitude": [10.0, 20.0],
+            "rh": [80.0, 90.0], "vis": [1000.0, 2000.0],
+        }
+    )
+
+
+def _api_csv(visibility_field: str, code: str, visibility: int) -> str:
+    return (
+        f"1\nV01301,VF01015_CN,V_CITY,V_COUNTY,V06001,V05001,V07001,V13003,{visibility_field}\n"
+        f"{code},站,城市,县,113,23,10,80,{visibility}\n"
+    )
+
+
+def _regional_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "code": ["R1", "R2"], "name": ["r1", "r2"], "city": ["c", "c"], "county": ["x", "x"],
+            "lon": [113.2, 113.8], "lat": [23.2, 23.8], "altitude": [12.0, 18.0],
+            "rh": [82.0, 88.0], "vis": [3000.0, np.nan],
+        }
+    )
+
+
+if __name__ == "__main__":
+    unittest.main()
