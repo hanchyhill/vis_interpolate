@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,11 +14,24 @@ import pandas as pd
 import xarray as xr
 
 from src.business.algorithms import estimate_both
-from src.business.api import NATIONAL_INTERFACE, REGIONAL_INTERFACE, VisibilityApiClient, _parse_response
+from src.business.api import (
+    NATIONAL_INTERFACE,
+    REGIONAL_INTERFACE,
+    VisibilityApiClient,
+    _mask_url,
+    _parse_response,
+)
 from src.business.config import DEFAULT_PROVINCES, ApiSettings, BusinessConfig
 from src.business.idw import create_visibility_grid
-from src.business.plot import plot_visibility
-from src.business.pipeline import close_logging, run_once, window_times
+from src.business.plot import _visibility_colormap, _visibility_norm, plot_cldas_visibility, plot_visibility
+from src.business.pipeline import (
+    close_logging,
+    hourly_visibility_times,
+    run_cldas_visibility_backfill,
+    run_once,
+    _beijing_timestamp,
+    window_times,
+)
 from src.business.state import PipelineState, process_lock
 
 
@@ -48,6 +63,27 @@ class BusinessPipelineTests(unittest.TestCase):
         )
         self.assertEqual(frame.iloc[0]["vis"], 25000)
 
+    def test_api_parse_error_includes_request_url_and_response_body(self) -> None:
+        class InvalidResponseClient(VisibilityApiClient):
+            def _request(self, interface_id, timestamp, province):
+                self._last_request_url = (
+                    "http://example.test/api?userId=u&pwd=secret&interfaceId="
+                    f"{interface_id}&prov={province}"
+                )
+                return "upstream error", None
+
+        client = InvalidResponseClient(ApiSettings(user_id="u", password="p"),)
+        with self.assertRaisesRegex(ValueError, "响应 body:\\nupstream error") as context:
+            client.fetch(datetime(2026, 8, 5, 8, 0, tzinfo=timezone.utc))
+        message = str(context.exception)
+        self.assertIn("请求 URL: http://example.test/api", message)
+        self.assertIn("pwd=%2A%2A%2A", message)
+        self.assertNotIn("secret", message)
+
+    def test_mask_url_preserves_request_parameters_without_password(self) -> None:
+        masked = _mask_url("http://example.test?a=1&pwd=secret&prov=%E5%B9%BF%E4%B8%9C")
+        self.assertEqual(masked, "http://example.test?a=1&pwd=%2A%2A%2A&prov=%E5%B9%BF%E4%B8%9C")
+
     def test_api_client_queries_and_merges_all_six_provinces(self) -> None:
         calls = []
 
@@ -65,6 +101,53 @@ class BusinessPipelineTests(unittest.TestCase):
         self.assertEqual(len(batch.national), len(DEFAULT_PROVINCES))
         self.assertEqual(len(batch.regional), len(DEFAULT_PROVINCES))
         self.assertEqual(batch.marker_counts, {"national": 6, "regional": 6})
+
+    def test_api_client_uses_bounded_concurrency_and_records_timings(self) -> None:
+        active = 0
+        maximum = 0
+        guard = threading.Lock()
+
+        class SlowClient(VisibilityApiClient):
+            def _request(self, interface_id, timestamp, province):
+                nonlocal active, maximum
+                with guard:
+                    active += 1
+                    maximum = max(maximum, active)
+                try:
+                    time.sleep(0.02)
+                    field = "V20001" if interface_id == NATIONAL_INTERFACE else "V20001_701_01"
+                    return _api_csv(field, f"{interface_id}-{province}", 1000), 1
+                finally:
+                    with guard:
+                        active -= 1
+
+        settings = ApiSettings(
+            user_id="u",
+            password="p",
+            provinces=("广东", "广西", "湖南"),
+            request_concurrency=2,
+        )
+        batch = SlowClient(settings).fetch(datetime(2026, 8, 5, 8, 0, tzinfo=timezone.utc))
+        self.assertGreater(maximum, 1)
+        self.assertLessEqual(maximum, 2)
+        self.assertEqual(len(batch.request_timings or {}), 6)
+        self.assertGreater(batch.parse_seconds, 0)
+
+    def test_state_backfill_queue_claims_oldest_pending_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = PipelineState(Path(directory) / "state.sqlite")
+            times = [
+                datetime(2026, 8, 5, 7, 50, tzinfo=timezone.utc),
+                datetime(2026, 8, 5, 7, 55, tzinfo=timezone.utc),
+                datetime(2026, 8, 5, 8, 0, tzinfo=timezone.utc),
+            ]
+            state.enqueue(times)
+            claimed = state.claim_backfill(exclude=times[-1], limit=1)
+            self.assertEqual(claimed, [times[0]])
+            state.queue_result(times[0], success=True)
+            state.enqueue(times)
+            claimed_next = state.claim_backfill(exclude=times[-1], limit=1)
+            self.assertEqual(claimed_next, [times[0]])
 
     def test_province_override_accepts_chinese_comma(self) -> None:
         config = BusinessConfig.from_file(provinces="广东，广西")
@@ -121,6 +204,93 @@ class BusinessPipelineTests(unittest.TestCase):
             [item.strftime("%H:%M") for item in window_times(now)],
             ["07:35", "07:40", "07:45", "07:50", "07:55"],
         )
+
+    def test_hourly_visibility_times_returns_two_completed_utc_hours(self) -> None:
+        now = datetime(2026, 8, 5, 8, 2, tzinfo=timezone.utc)
+        self.assertEqual(
+            [item.strftime("%Y%m%d%H") for item in hourly_visibility_times(now)],
+            ["2026080507", "2026080506"],
+        )
+
+    def test_plot_title_timestamp_uses_beijing_time(self) -> None:
+        utc_time = datetime(2026, 8, 5, 16, 2, tzinfo=timezone.utc)
+        self.assertEqual(_beijing_timestamp(utc_time, "%Y%m%d%H%M"), "202608060002")
+
+    def test_cldas_contourf_plot_uses_boundary_and_saves_png(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            boundary_path = root / "guangdong.geojson"
+            boundary_path.write_text(
+                json.dumps(
+                    {
+                        "type": "FeatureCollection",
+                        "features": [{
+                            "type": "Feature",
+                            "properties": {},
+                            "geometry": {
+                                "type": "Polygon",
+                                "coordinates": [[[113, 23], [114, 23], [114, 24], [113, 24], [113, 23]]],
+                            },
+                        }],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            visibility = xr.DataArray(
+                np.array([[500.0, 1000.0, 2000.0], [3000.0, 4000.0, 5000.0], [6000.0, 7000.0, 8000.0]]),
+                dims=("lat", "lon"),
+                coords={"lat": [23.1, 23.5, 23.9], "lon": [113.1, 113.5, 113.9]},
+            )
+            output = root / "images" / "cldas.png"
+            with patch("src.business.plot.load_visibility_data", return_value=visibility):
+                result = plot_cldas_visibility("VIS_2026080507.NC", boundary_path, output)
+            self.assertEqual(result, output)
+            self.assertTrue(output.exists())
+            self.assertGreater(output.stat().st_size, 0)
+
+    def test_missing_cldas_product_is_skipped_without_raising(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            boundary_path = root / "guangdong.geojson"
+            boundary_path.write_text(
+                json.dumps({
+                    "type": "FeatureCollection",
+                    "features": [{
+                        "type": "Feature",
+                        "properties": {},
+                        "geometry": {
+                            "type": "Polygon",
+                            "coordinates": [[[113, 23], [114, 23], [114, 24], [113, 24], [113, 23]]],
+                        },
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            config = BusinessConfig(
+                repo_root=root,
+                api=ApiSettings(user_id="u", password="p"),
+                dem_path=root / "dem.nc",
+                state_path=root / "state.sqlite",
+                lock_path=root / "pipeline.lock",
+                log_path=root / "business.log",
+                csv_national_root=root / "csv-national",
+                csv_combined_root=root / "csv-combined",
+                nc_national_root=root / "nc-national",
+                nc_combined_root=root / "nc-combined",
+                guangdong_boundary_path=boundary_path,
+                vis_img_root=root / "images",
+            )
+            with patch(
+                "src.business.pipeline.plot_cldas_visibility",
+                side_effect=FileNotFoundError("数据尚未生成"),
+            ):
+                outputs = run_cldas_visibility_backfill(
+                    datetime(2026, 8, 5, 8, 2, tzinfo=timezone.utc),
+                    config,
+                    async_plot=False,
+                )
+            self.assertEqual(outputs, [])
+            self.assertEqual(list((root / "images").rglob("*.png")), [])
 
     def test_state_reprocesses_only_when_count_increases(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -179,6 +349,14 @@ class BusinessPipelineTests(unittest.TestCase):
             output = plot_visibility(nc_path, boundary_path, root / "images" / "result.png")
             self.assertTrue(output.exists())
             self.assertGreater(output.stat().st_size, 0)
+
+    def test_visibility_colormap_has_breaks_at_fog_thresholds(self) -> None:
+        cmap = _visibility_colormap()
+        norm = _visibility_norm()
+        self.assertNotEqual(tuple(cmap(norm(0.99))), tuple(cmap(norm(1.01))))
+        self.assertNotEqual(tuple(cmap(norm(9.99))), tuple(cmap(norm(10.01))))
+        self.assertNotEqual(tuple(cmap(norm(19.99))), tuple(cmap(norm(20.01))))
+        self.assertEqual(len(norm.boundaries), 257)
 
     def test_file_lock_skips_second_holder(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -242,6 +420,9 @@ class BusinessPipelineTests(unittest.TestCase):
                     nc_combined_root=data / "nc-combined",
                     vis_img_root=data / "vis-img",
                     guangdong_boundary_path=boundary_path,
+                    source_ready_delay_minutes=5,
+                    max_backfill_slots_per_cycle=4,
+                    async_plots=False,
                 )
                 timestamp = datetime(2026, 8, 5, 8, 2, tzinfo=timezone.utc)
                 first = run_once(timestamp, config)

@@ -14,6 +14,12 @@
   "statePath": "business/pipeline_state.sqlite",
   "lockPath": "business/pipeline.lock",
   "logPath": "business/business.log",
-  "timeoutSeconds": 60,
-  "retries": 3
+  "timeoutSeconds": 15,
+  "retries": 2,
+  "requestConcurrency": 6,
+  "sourceReadyDelayMinutes": 2,
+  "latestFirst": true,
+  "maxBackfillSlotsPerCycle": 1,
+  "asyncPlots": true,
+  "pollIntervalSeconds": 5
 }

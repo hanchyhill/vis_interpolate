@@ -301,7 +301,14 @@ uv sync
   "guangdongBoundaryPath": "D:/vis_interpolate/data/boundary/广东省_省界.shp",
   "statePath": "business/pipeline_state.sqlite",
   "lockPath": "business/pipeline.lock",
-  "logPath": "business/business.log"
+  "logPath": "business/business.log",
+  "timeoutSeconds": 15,
+  "retries": 2,
+  "requestConcurrency": 6,
+  "sourceReadyDelayMinutes": 2,
+  "latestFirst": true,
+  "maxBackfillSlotsPerCycle": 1,
+  "asyncPlots": true
 }
 ```
 
@@ -328,7 +335,7 @@ uv run python -m src.business run-once --provinces 广东,广西,湖南,江西,�
 uv run python -m src.business run-once --province 广西
 ```
 
-常驻模式会持续运行，在每小时 `02、07、12、17、22、27、32、37、42、47、52、57` 分启动一轮处理。部署到Windows服务或任务计划时，建议保持 `serve` 进程常驻；手动停止可使用 `Ctrl+C`。
+常驻模式会持续运行，在每小时 `02、07、12、17、22、27、32、37、42、47、52、57` 分启动一轮处理。默认距离上游时次 2 分钟后开始处理，最新就绪时次优先，最多补偿 1 个旧时次；图片进入后台单线程队列生成，不阻塞 CSV 和 NetCDF 发布。部署到Windows服务或任务计划时，建议保持 `serve` 进程常驻；手动停止可使用 `Ctrl+C`。
 
 #### 使用 PM2 持久化守护
 
@@ -391,7 +398,7 @@ uv run python -m src.business.plot \
 如果配置的 `guangdongBoundaryPath` 不存在，业务数据仍会正常输出，但该资料时次会在日志中提示未生成图片；服务器部署时应把该边界文件路径配置正确。
 - 样本计数、锁文件和运行日志：分别由 `statePath`、`lockPath`、`logPath` 配置。
 
-常驻调度在每小时 `02、07、12、17、22、27、32、37、42、47、52、57` 分启动；每轮扫描世界时前30分钟内且距当前至少5分钟的5分钟资料时次。业务状态保存在 `data/business/pipeline_state.sqlite`，运行日志保存在 `data/business/business.log`。输出文件按 `YYYY/MM/DD` 分层保存到两个估算CSV目录和 `data/idw_nc/national`、`data/idw_nc/national_and_regional` 目录。
+常驻调度在每小时 `02、07、12、17、22、27、32、37、42、47、52、57` 分启动；每轮扫描世界时前30分钟内、达到 `sourceReadyDelayMinutes` 的5分钟资料时次，先处理最新时次，再从 `observation_queue` 补偿旧时次。业务状态、补偿队列和阶段指标保存在 `data/business/pipeline_state.sqlite`，运行日志保存在 `data/business/business.log`。日志中的 `api_seconds`、`parse_seconds`、`estimate_seconds`、`idw_seconds`、`publish_seconds`、`plot_submit_seconds`、`source_update_time_utc` 和 `data_delay_seconds` 用于统计真实延迟。输出文件按 `YYYY/MM/DD` 分层保存到两个估算CSV目录和 `data/idw_nc/national`、`data/idw_nc/national_and_regional` 目录。
 
 ## 项目结构
 

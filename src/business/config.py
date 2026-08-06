@@ -22,8 +22,9 @@ class ApiSettings:
     # province保留用于兼容旧调用；未指定时使用provinces中的六省范围。
     province: str | None = None
     provinces: tuple[str, ...] = DEFAULT_PROVINCES
-    timeout_seconds: int = 60
-    retries: int = 3
+    timeout_seconds: int = 15
+    retries: int = 2
+    request_concurrency: int = 6
 
     def requested_provinces(self) -> tuple[str, ...]:
         values = (self.province,) if self.province else self.provinces
@@ -49,6 +50,11 @@ class BusinessConfig:
     schedule_minutes: tuple[int, ...] = field(
         default=(2, 7, 12, 17, 22, 27, 32, 37, 42, 47, 52, 57)
     )
+    source_ready_delay_minutes: int = 2
+    latest_first: bool = True
+    max_backfill_slots_per_cycle: int = 1
+    async_plots: bool = True
+    poll_interval_seconds: int = 5
 
     @classmethod
     def from_file(
@@ -99,8 +105,9 @@ class BusinessConfig:
             password=str(password),
             province=selected_province,
             provinces=selected_provinces,
-            timeout_seconds=int(values.get("timeoutSeconds", 60)),
-            retries=max(1, int(values.get("retries", 3))),
+            timeout_seconds=max(1, int(values.get("timeoutSeconds", 15))),
+            retries=max(1, int(values.get("retries", 2))),
+            request_concurrency=max(1, int(values.get("requestConcurrency", 6))),
         )
         data_root = _resolve_path(values.get("dataRoot", "data"), root)
         default_dem = _resolve_path("data/assets/dem/merged_dem_data.nc", root)
@@ -126,6 +133,11 @@ class BusinessConfig:
             guangdong_boundary_path=_resolve_path(
                 values.get("guangdongBoundaryPath", default_boundary), root
             ),
+            source_ready_delay_minutes=max(0, int(values.get("sourceReadyDelayMinutes", 2))),
+            latest_first=bool(values.get("latestFirst", True)),
+            max_backfill_slots_per_cycle=max(0, int(values.get("maxBackfillSlotsPerCycle", 1))),
+            async_plots=bool(values.get("asyncPlots", True)),
+            poll_interval_seconds=max(1, int(values.get("pollIntervalSeconds", 5))),
         )
 
 

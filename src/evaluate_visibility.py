@@ -77,21 +77,20 @@ def load_visibility_data(data_path: str):
         vis_data: xarray.DataArray, 能见度数据
     """
     try:
-        # 加载数据
-        ds = xr.open_dataset(data_path)
-
-        # 获取能见度数据
-        if 'visibility' in ds:
-            vis_data = ds['visibility']
-        elif 'vis000' in ds:
-            vis_data = ds['vis000'][0, 0, :, :]
-        else:
-            # 尝试获取第一个数据变量
-            var_name = list(ds.data_vars)[0]
-            vis_data = ds[var_name]
+        # 立即加载到内存后关闭文件，避免定时绘图长期占用本地文件或
+        # OPeNDAP 连接。国家局产品的 vis000 维度为 time/level/lat/lon。
+        with xr.open_dataset(data_path) as ds:
+            if 'visibility' in ds:
+                vis_data = ds['visibility'].load()
+            elif 'vis000' in ds:
+                vis_data = ds['vis000'][0, 0, :, :].load()
+            else:
+                # 尝试获取第一个数据变量
+                var_name = list(ds.data_vars)[0]
+                vis_data = ds[var_name].load()
 
         # 转换单位如果需要（从m转换为km）
-        if vis_data.max() > 100:  # 如果最大值大于100，可能是米单位
+        if float(vis_data.max(skipna=True).values) > 100:  # 如果最大值大于100，可能是米单位
             vis_data = vis_data / 1000
 
         return vis_data

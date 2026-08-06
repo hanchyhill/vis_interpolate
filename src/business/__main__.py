@@ -25,7 +25,7 @@ def main() -> None:
         run_forever(config)
     else:
         now = datetime.fromisoformat(args.now) if args.now else None
-        run_once(now=now, config=config)
+        run_once(now=now, config=config, include_cldas=True)
 
 
 if __name__ == "__main__":

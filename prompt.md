@@ -53,3 +53,9 @@ YYYY/MM/DD/
 当在Windows平台运行时，使用配置 @src\config\local.config.json
 当在linux平台运行时，使用配置 @src\config\server.config.json
 另外，在 pm2配置中，由于服务器在linux当中，默认使用的是server.config.json @ecosystem.config.cjs
+
+## 任务，给business任务流添加 国家局5km能见度实况融合产品（按小时）的出图
+在 @@src\business\， 新增一个定时绘制国家局5km能见度实况融合产品（按小时）的出图，其数据采样频率是1小时，而不是当前的5分钟数据。
+在 @src\evaluate_visibility.py 有读取方法，绘图coutourf 色标参照现有 business 的色标。
+在现有定时流程中，添加国家局5km能见度实况融合产品的绘图，注意实现尽量避免对现有流程的影响。 只需要补采过去2个小时(2个样本)的数据即可。
+注意数据缺失的异常捕获，如果 打开文件出现错误，说明数据还没生成。

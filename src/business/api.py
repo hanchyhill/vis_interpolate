@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import io
+import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
 
@@ -31,6 +34,10 @@ class StationBatch:
     national: pd.DataFrame
     regional: pd.DataFrame
     marker_counts: dict[str, int | None]
+    errors: tuple[str, ...] = ()
+    request_timings: dict[str, float] | None = None
+    parse_seconds: float = 0.0
+    source_update_time: datetime | None = None
 
     @property
     def sample_counts(self) -> dict[str, int]:
@@ -47,6 +54,8 @@ class StationBatch:
 class VisibilityApiClient:
     def __init__(self, settings: ApiSettings):
         self.settings = settings
+        self._last_request_url: str | None = None
+        self._request_context = threading.local()
 
     def fetch(self, timestamp: datetime) -> StationBatch:
         timestamp = _as_utc(timestamp)
@@ -54,36 +63,90 @@ class VisibilityApiClient:
         regional_frames: list[pd.DataFrame] = []
         national_markers: list[int | None] = []
         regional_markers: list[int | None] = []
-        for province in self.settings.requested_provinces():
-            national_text, national_marker = self._request(NATIONAL_INTERFACE, timestamp, province)
-            regional_text, regional_marker = self._request(REGIONAL_INTERFACE, timestamp, province)
-            national_frames.append(
-                _parse_response(
-                    national_text,
-                    _NATIONAL_FIELDS,
-                    "V20001",
-                    fallback_visibility_fields=("V20001_701_01",),
-                )
-            )
-            regional_frames.append(
-                _parse_response(
-                    regional_text,
-                    _REGIONAL_FIELDS,
-                    "V20001_701_01",
-                    fallback_visibility_fields=("V20001",),
-                )
-            )
-            national_markers.append(national_marker)
-            regional_markers.append(regional_marker)
+        errors: list[str] = []
+        request_timings: dict[str, float] = {}
+        parse_seconds = 0.0
+        tasks = [
+            (NATIONAL_INTERFACE, province, _NATIONAL_FIELDS, "V20001", ("V20001_701_01",))
+            for province in self.settings.requested_provinces()
+        ] + [
+            (REGIONAL_INTERFACE, province, _REGIONAL_FIELDS, "V20001_701_01", ("V20001",))
+            for province in self.settings.requested_provinces()
+        ]
+        with ThreadPoolExecutor(
+            max_workers=min(self.settings.request_concurrency, max(1, len(tasks))),
+            thread_name_prefix="visibility-api",
+        ) as executor:
+            futures = {
+                executor.submit(self._fetch_one, timestamp, *task): task[:2]
+                for task in tasks
+            }
+            for future in as_completed(futures):
+                interface_id, province = futures[future]
+                key = f"{interface_id}:{province}"
+                frame, marker, elapsed, request_elapsed, parsed_elapsed, error = future.result()
+                request_timings[key] = request_elapsed
+                parse_seconds += parsed_elapsed
+                if error:
+                    errors.append(error)
+                    continue
+                if interface_id == NATIONAL_INTERFACE:
+                    national_frames.append(frame)
+                    national_markers.append(marker)
+                else:
+                    regional_frames.append(frame)
+                    regional_markers.append(marker)
         if not national_frames or not regional_frames:
-            raise ValueError("没有配置可请求的省份")
+            detail = "\n".join(errors)
+            raise ValueError(f"没有获得国家站或区域站有效响应{': ' + detail if detail else ''}")
         national = _merge_province_frames(national_frames)
         regional = _merge_province_frames(regional_frames)
         return StationBatch(
             national=national,
             regional=regional,
             marker_counts={"national": _sum_markers(national_markers), "regional": _sum_markers(regional_markers)},
+            errors=tuple(sorted(errors)),
+            request_timings=request_timings,
+            parse_seconds=parse_seconds,
+            source_update_time=_latest_update_time(national, regional),
         )
+
+    def _fetch_one(
+        self,
+        timestamp: datetime,
+        interface_id: str,
+        province: str,
+        fields: list[str],
+        visibility_field: str,
+        fallback_visibility_fields: tuple[str, ...],
+    ) -> tuple[pd.DataFrame | None, int | None, float, float, float, str | None]:
+        started = time.perf_counter()
+        try:
+            request_started = time.perf_counter()
+            text, marker = self._request(interface_id, timestamp, province)
+            request_elapsed = time.perf_counter() - request_started
+            parse_started = time.perf_counter()
+            try:
+                frame = _parse_response(
+                    text,
+                    fields,
+                    visibility_field,
+                    fallback_visibility_fields=fallback_visibility_fields,
+                )
+            except Exception as exc:  # noqa: BLE001 - include raw response for diagnosis
+                error = _format_response_error(
+                    exc,
+                    interface_id,
+                    province,
+                    getattr(self._request_context, "last_request_url", None) or self._last_request_url,
+                    text,
+                )
+                return None, None, time.perf_counter() - started, request_elapsed, time.perf_counter() - parse_started, error
+            return frame, marker, time.perf_counter() - started, request_elapsed, time.perf_counter() - parse_started, None
+        except Exception as exc:  # noqa: BLE001 - isolate one province/interface failure
+            return None, None, time.perf_counter() - started, time.perf_counter() - started, 0.0, (
+                f"接口请求失败（接口={interface_id}, 省份={province}）: {exc}"
+            )
 
     def _request(self, interface_id: str, timestamp: datetime, province: str) -> tuple[str, int | None]:
         query = urllib.parse.urlencode(
@@ -100,7 +163,11 @@ class VisibilityApiClient:
             f"{self.settings.base_url}?{query}",
             headers={"User-Agent": "vis-interpolate-business/1.0", "Accept": "text/csv,*/*"},
         )
+        request_url = request.full_url
+        self._last_request_url = request_url
+        self._request_context.last_request_url = request_url
         last_error: Exception | None = None
+        last_body: str | None = None
         for attempt in range(self.settings.retries):
             try:
                 with urllib.request.urlopen(request, timeout=self.settings.timeout_seconds) as response:
@@ -108,11 +175,22 @@ class VisibilityApiClient:
                 text = raw.decode("utf-8-sig")
                 marker = _response_marker(text)
                 return text, marker
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                try:
+                    last_body = exc.read().decode("utf-8-sig", errors="replace")
+                except Exception:  # noqa: BLE001 - retain the HTTP error if body cannot be read
+                    last_body = None
             except Exception as exc:  # noqa: BLE001 - retry boundary
                 last_error = exc
-                if attempt + 1 < self.settings.retries:
-                    time.sleep(2**attempt)
-        raise RuntimeError(f"接口 {interface_id} 请求失败: {last_error}") from last_error
+            if attempt + 1 < self.settings.retries:
+                time.sleep(2**attempt)
+        raise RuntimeError(
+            f"接口 {interface_id} 请求失败\n"
+            f"请求 URL: {_mask_url(request_url)}\n"
+            f"响应 body:\n{last_body or '<empty>'}\n"
+            f"错误: {last_error}"
+        ) from last_error
 
 
 def _merge_province_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
@@ -138,6 +216,35 @@ def _response_marker(text: str) -> int | None:
             except ValueError:
                 return None
     return None
+
+
+def _mask_url(url: str | None) -> str:
+    """隐藏 URL 中的 API 密码，保留其余请求参数用于排查。"""
+    if not url:
+        return "<unknown>"
+    parsed = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    masked_query = urllib.parse.urlencode([
+        (key, "***" if key.lower() in {"pwd", "password"} else value)
+        for key, value in query
+    ])
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, masked_query, parsed.fragment)
+    )
+
+
+def _format_response_error(
+    error: Exception,
+    interface_id: str,
+    province: str,
+    request_url: str | None,
+    body: str,
+) -> str:
+    return (
+        f"{error}（接口={interface_id}, 省份={province}）\n"
+        f"请求 URL: {_mask_url(request_url)}\n"
+        f"响应 body:\n{body or '<empty>'}"
+    )
 
 
 def _parse_response(
@@ -192,10 +299,20 @@ def _parse_response(
         sort_columns.append("_update_time")
         ascending.append(False)
     frame = frame.sort_values(sort_columns, ascending=ascending, kind="stable")
-    frame = frame.drop_duplicates("code", keep="first").drop(
-        columns=[column for column in ["_quality", "_update_time"] if column in frame]
-    )
+    frame = frame.drop_duplicates("code", keep="first").drop(columns=["_quality"])
     return frame.reset_index(drop=True)
+
+
+def _latest_update_time(*frames: pd.DataFrame) -> datetime | None:
+    values: list[pd.Timestamp] = []
+    for frame in frames:
+        if "_update_time" not in frame:
+            continue
+        parsed = pd.to_datetime(frame["_update_time"], errors="coerce", utc=True).dropna()
+        values.extend(parsed.tolist())
+    if not values:
+        return None
+    return max(values).to_pydatetime()
 
 
 def _normalize_codes(values: pd.Series) -> pd.Series:

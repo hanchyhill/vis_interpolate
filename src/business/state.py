@@ -41,6 +41,19 @@ class PipelineState:
                     status TEXT NOT NULL,
                     error TEXT,
                     outputs TEXT,
+                    metrics TEXT,
+                    updated_at TEXT NOT NULL
+                )"""
+            )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(observations)")}
+            if "metrics" not in columns:
+                conn.execute("ALTER TABLE observations ADD COLUMN metrics TEXT")
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS observation_queue (
+                    observation_time TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
                     updated_at TEXT NOT NULL
                 )"""
             )
@@ -59,18 +72,33 @@ class PipelineState:
     def seen(self, observation_time: datetime, counts: dict[str, int], status: str = "seen") -> None:
         self._upsert(observation_time, counts, status=status)
 
-    def success(self, observation_time: datetime, counts: dict[str, int], outputs: list[str]) -> None:
+    def success(
+        self,
+        observation_time: datetime,
+        counts: dict[str, int],
+        outputs: list[str],
+        metrics: dict[str, object] | None = None,
+    ) -> None:
         key = _time_key(observation_time)
         with self._connection() as conn:
             conn.execute(
                 """INSERT INTO observations
-                   (observation_time,last_seen_counts,last_processed_counts,status,error,outputs,updated_at)
-                   VALUES (?,?,?,?,?,?,?)
+                   (observation_time,last_seen_counts,last_processed_counts,status,error,outputs,metrics,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?)
                    ON CONFLICT(observation_time) DO UPDATE SET
                      last_seen_counts=excluded.last_seen_counts,
                      last_processed_counts=excluded.last_processed_counts,
-                     status=excluded.status,error=NULL,outputs=excluded.outputs,updated_at=excluded.updated_at""",
-                (key, json.dumps(counts), json.dumps(counts), "success", None, json.dumps(outputs), _now()),
+                     status=excluded.status,error=NULL,outputs=excluded.outputs,metrics=excluded.metrics,updated_at=excluded.updated_at""",
+                (
+                    key,
+                    json.dumps(counts),
+                    json.dumps(counts),
+                    "success",
+                    None,
+                    json.dumps(outputs),
+                    json.dumps(metrics or {}, ensure_ascii=False),
+                    _now(),
+                ),
             )
 
     def failure(self, observation_time: datetime, counts: dict[str, int] | None, error: str) -> None:
@@ -88,12 +116,55 @@ class PipelineState:
         with self._connection() as conn:
             conn.execute(
                 """INSERT INTO observations
-                   (observation_time,last_seen_counts,last_processed_counts,status,error,outputs,updated_at)
-                   VALUES (?,?,?,?,?,?,?)
+                   (observation_time,last_seen_counts,last_processed_counts,status,error,outputs,metrics,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?)
                    ON CONFLICT(observation_time) DO UPDATE SET
                      last_seen_counts=COALESCE(excluded.last_seen_counts, observations.last_seen_counts),
                      status=excluded.status,error=excluded.error,updated_at=excluded.updated_at""",
-                (key, json.dumps(counts) if counts is not None else None, None, status, error, None, _now()),
+                (key, json.dumps(counts) if counts is not None else None, None, status, error, None, None, _now()),
+            )
+
+    def enqueue(self, observation_times: list[datetime]) -> None:
+        now = _now()
+        with self._connection() as conn:
+            conn.executemany(
+                """INSERT INTO observation_queue(observation_time,status,attempts,error,updated_at)
+                   VALUES (?, 'pending', 0, NULL, ?)
+                   ON CONFLICT(observation_time) DO UPDATE SET
+                     status=CASE WHEN status='processing' THEN status ELSE 'pending' END,
+                     error=CASE WHEN status='processing' THEN error ELSE NULL END,
+                     updated_at=excluded.updated_at""",
+                [(_time_key(value), now) for value in observation_times],
+            )
+
+    def claim_backfill(self, *, exclude: datetime, limit: int) -> list[datetime]:
+        if limit <= 0:
+            return []
+        excluded = _time_key(exclude)
+        with self._connection() as conn:
+            rows = conn.execute(
+                """SELECT observation_time FROM observation_queue
+                   WHERE observation_time <> ? AND status IN ('pending', 'failed')
+                   ORDER BY observation_time ASC LIMIT ?""",
+                (excluded, limit),
+            ).fetchall()
+            now = _now()
+            for row in rows:
+                conn.execute(
+                    """UPDATE observation_queue
+                       SET status='processing', attempts=attempts + 1, updated_at=?
+                       WHERE observation_time=?""",
+                    (now, row["observation_time"]),
+                )
+        return [_parse_time_key(row["observation_time"]) for row in rows]
+
+    def queue_result(self, observation_time: datetime, *, success: bool, error: str | None = None) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                """UPDATE observation_queue
+                   SET status=?, error=?, updated_at=?
+                   WHERE observation_time=?""",
+                ("done" if success else "failed", error, _now(), _time_key(observation_time)),
             )
 
 
@@ -101,6 +172,10 @@ def _time_key(value: datetime) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_time_key(value: str) -> datetime:
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
 
 
 def _now() -> str:
