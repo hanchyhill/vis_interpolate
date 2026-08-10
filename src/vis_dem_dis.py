@@ -522,6 +522,12 @@ if __name__ == "__main__":
     # 多进程设置
     num_processes = max(1, cpu_count() - 1)  # 保留1个核心给系统
 
+    # 是否启用可视化（会显著增加处理时间）
+    enable_visualization = False
+
+    # 多进程设置
+    num_processes = max(1, cpu_count() - 1)  # 保留1个核心给系统
+
     # 定义输出目录
     output_dir = Path(path.dirname(__file__)) / f'../data/idw_nc/{source_type}'
     output_dir.mkdir(parents=True, exist_ok=True)
