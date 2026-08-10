@@ -11,6 +11,8 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from sklearn.neighbors import NearestNeighbors
+from multiprocessing import Pool, cpu_count
+import os
 
 
 # 设置中文字体
@@ -360,6 +362,78 @@ def visualize_visibility_result(df_station, vis_da, ds_dem, save_path=None):
     
     # plt.show()
 
+def process_single_time(args):
+    """
+    处理单个时次的能见度插值（多进程worker函数）
+
+    Parameters:
+    args: tuple, 包含 (current_date, source_type, output_dir, dem_path, visualize)
+
+    Returns:
+    dict: 处理结果 {'time': datetime, 'status': str, 'message': str}
+    """
+    current_date, source_type, output_dir, dem_path, visualize = args
+
+    time_str = current_date.strftime('%Y%m%d%H%M')
+    time_display = current_date.strftime('%Y-%m-%d %H:%M')
+
+    result = {
+        'time': current_date,
+        'time_str': time_display,
+        'status': 'failed',
+        'message': ''
+    }
+
+    # 获取CSV路径
+    csv_path = get_csv_path_for_time(current_date, source_type)
+
+    # 检查文件是否存在
+    if not csv_path.exists():
+        result['status'] = 'skipped'
+        result['message'] = f"文件不存在: {csv_path.name}"
+        return result
+
+    # 检查输出文件是否已存在
+    output_nc = output_dir / f'visibility_anisotropic_idw_{time_str}.nc'
+    if output_nc.exists():
+        result['status'] = 'cached'
+        result['message'] = f"输出文件已存在: {output_nc.name}"
+        return result
+
+    try:
+        # 加载DEM数据（每个进程独立加载）
+        ds_dem = xr.open_dataset(dem_path)
+
+        # 读取站点数据
+        df_station = pd.read_csv(csv_path)
+
+        # 创建能见度插值网格
+        vis_grid = create_visibility_grid(
+            df_station, ds_dem,
+            beta=10.0,      # 垂直方向权重放大因子
+            power=2.0,      # 权重幂次
+            n_neighbors=6   # 使用最近的6个邻居
+        )
+
+        # 保存插值结果
+        vis_grid.to_netcdf(output_nc)
+
+        # 可视化结果（每6小时保存一次图片）
+        if visualize and current_date.hour % 6 == 0:
+            output_png = output_dir / f'visibility_interpolation_result_{time_str}.png'
+            visualize_visibility_result(df_station, vis_grid, ds_dem, save_path=str(output_png))
+            result['message'] = f"成功 (站点: {len(df_station)}, 已可视化)"
+        else:
+            result['message'] = f"成功 (站点: {len(df_station)})"
+
+        result['status'] = 'success'
+
+    except Exception as e:
+        result['status'] = 'failed'
+        result['message'] = f"处理失败: {str(e)}"
+
+    return result
+
 # 主执行代码
 if __name__ == "__main__":
     # 定义日期范围
@@ -369,86 +443,86 @@ if __name__ == "__main__":
     # 选择数据源类型: "national" 或 "national_and_regional"
     source_type = "national"
 
+    # 是否启用可视化（会显著增加处理时间）
+    enable_visualization = False
+
+    # 多进程设置
+    num_processes = max(1, cpu_count() - 1)  # 保留1个核心给系统
+
     # 定义输出目录
     output_dir = Path(path.dirname(__file__)) / f'../data/idw_nc/{source_type}'
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 读取DEM数据（全局使用）
-    print("=== 加载DEM数据 ===")
-    ds_dem = xr.open_dataset(r'h:\data\DEM\merged_dem_data.nc')
-    print(f"DEM网格大小: {len(ds_dem.lat)} × {len(ds_dem.lon)}")
-    print(f"经度范围: {ds_dem.lon.min().values:.4f}° - {ds_dem.lon.max().values:.4f}°")
-    print(f"纬度范围: {ds_dem.lat.min().values:.4f}° - {ds_dem.lat.max().values:.4f}°")
+    # DEM数据路径
+    dem_path = r'h:\data\DEM\merged_dem_data.nc'
 
-    # 时间循环统计
+    # 验证DEM文件存在
+    if not Path(dem_path).exists():
+        print(f"错误: DEM文件不存在: {dem_path}")
+        exit(1)
+
+    # 生成所有时次列表
     current_date = start_date
-    total_hours = int((end_date - start_date).total_seconds() / 3600)
-    processed = 0
-    skipped = 0
+    all_times = []
+    while current_date <= end_date:
+        all_times.append(current_date)
+        current_date += timedelta(hours=1)
 
-    print("\n" + "=" * 80)
-    print(f"能见度空间插值（各向异性IDW）")
+    total_hours = len(all_times)
+
+    print("=" * 80)
+    print(f"能见度空间插值（各向异性IDW - 多进程模式）")
     print(f"数据源类型: {source_type}")
     print(f"起始时间: {start_date.strftime('%Y-%m-%d %H:%M')}")
     print(f"结束时间: {end_date.strftime('%Y-%m-%d %H:%M')}")
     print(f"总时次数: {total_hours}")
+    print(f"进程数量: {num_processes}")
+    print(f"CPU核心数: {cpu_count()}")
+    print(f"可视化功能: {'启用' if enable_visualization else '禁用'}")
     print(f"输出目录: {output_dir}")
     print("=" * 80)
 
-    while current_date <= end_date:
-        time_str = current_date.strftime('%Y%m%d%H%M')
-        time_display = current_date.strftime('%Y-%m-%d %H:%M')
+    # 准备多进程参数
+    process_args = [
+        (time_point, source_type, output_dir, dem_path, enable_visualization)
+        for time_point in all_times
+    ]
 
-        print(f"\n处理时次: {time_display} ({processed + skipped + 1}/{total_hours})")
+    # 使用多进程池处理
+    start_time = time.time()
+    results = []
 
-        # 获取CSV路径
-        csv_path = get_csv_path_for_time(current_date, source_type)
+    with Pool(processes=num_processes) as pool:
+        # 使用imap_unordered以便实时显示结果
+        for i, result in enumerate(pool.imap_unordered(process_single_time, process_args), 1):
+            results.append(result)
 
-        # 检查文件是否存在
-        if not csv_path.exists():
-            print(f"✗ 文件不存在: {csv_path}")
-            skipped += 1
-            current_date += timedelta(hours=1)
-            continue
+            # 实时输出进度
+            status_icon = {
+                'success': '✓',
+                'cached': '○',
+                'skipped': '✗',
+                'failed': '✗'
+            }
+            icon = status_icon.get(result['status'], '?')
 
-        try:
-            # 读取站点数据
-            df_station = pd.read_csv(csv_path)
-            print(f"  站点数量: {len(df_station)}")
+            print(f"[{i}/{total_hours}] {icon} {result['time_str']} - {result['message']}")
 
-            # 创建能见度插值网格
-            vis_grid = create_visibility_grid(
-                df_station, ds_dem,
-                beta=10.0,      # 垂直方向权重放大因子
-                power=2.0,      # 权重幂次
-                n_neighbors=6   # 使用最近的6个邻居
-            )
+    # 统计结果
+    elapsed_time = time.time() - start_time
+    success_count = sum(1 for r in results if r['status'] == 'success')
+    cached_count = sum(1 for r in results if r['status'] == 'cached')
+    skipped_count = sum(1 for r in results if r['status'] == 'skipped')
+    failed_count = sum(1 for r in results if r['status'] == 'failed')
 
-            # 保存插值结果
-            output_nc = output_dir / f'visibility_anisotropic_idw_{time_str}.nc'
-            vis_grid.to_netcdf(output_nc)
-            print(f"  ✓ 插值结果已保存: {output_nc.name}")
-
-            # 可视化结果（每6小时保存一次图片）
-            if current_date.hour % 6 == 0:
-                output_png = output_dir / f'visibility_interpolation_result_{time_str}.png'
-                visualize_visibility_result(df_station, vis_grid, ds_dem, save_path=str(output_png))
-                print(f"  ✓ 可视化结果已保存: {output_png.name}")
-
-            processed += 1
-
-        except Exception as e:
-            print(f"✗ 处理失败: {e}")
-            skipped += 1
-
-        # 移动到下一个时次（每小时）
-        current_date += timedelta(hours=1)
-
-    # 输出汇总信息
     print("\n" + "=" * 80)
     print("处理完成!")
-    print(f"成功处理: {processed} 个时次")
-    print(f"跳过时次: {skipped} 个")
+    print(f"总耗时: {elapsed_time / 60:.2f} 分钟 ({elapsed_time / 3600:.2f} 小时)")
+    print(f"平均速度: {elapsed_time / total_hours:.2f} 秒/时次")
+    print(f"成功处理: {success_count} 个时次")
+    print(f"缓存跳过: {cached_count} 个时次")
+    print(f"文件缺失: {skipped_count} 个时次")
+    print(f"处理失败: {failed_count} 个时次")
     print(f"输出目录: {output_dir}")
     print("=" * 80)
 
