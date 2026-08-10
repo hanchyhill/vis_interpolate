@@ -9,6 +9,10 @@ import pandas as pd
 from datetime import datetime, timedelta
 from pathlib import Path, PureWindowsPath
 from typing import Dict
+import shutil
+import tempfile
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import urlopen
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -77,17 +81,16 @@ def load_visibility_data(data_path: str):
         vis_data: xarray.DataArray, 能见度数据
     """
     try:
-        # 立即加载到内存后关闭文件，避免定时绘图长期占用本地文件或
-        # OPeNDAP 连接。国家局产品的 vis000 维度为 time/level/lat/lon。
-        with xr.open_dataset(data_path) as ds:
-            if 'visibility' in ds:
-                vis_data = ds['visibility'].load()
-            elif 'vis000' in ds:
-                vis_data = ds['vis000'][0, 0, :, :].load()
-            else:
-                # 尝试获取第一个数据变量
-                var_name = list(ds.data_vars)[0]
-                vis_data = ds[var_name].load()
+        # OPeNDAP 对整张全国网格的读取可能长时间阻塞，且 xarray 后端不便
+        # 统一设置读取超时。国家局同时提供 fileServer，因此先以有超时的
+        # HTTP 下载到临时文件，再一次性加载并关闭文件，避免绘图线程永久卡住。
+        if str(data_path).lower().startswith(("http://", "https://")):
+            with tempfile.TemporaryDirectory(prefix="cldas_visibility_") as temp_dir:
+                local_path = Path(temp_dir) / Path(urlsplit(str(data_path)).path).name
+                _download_cldas_file(str(data_path), local_path)
+                vis_data = _load_visibility_dataset(local_path)
+        else:
+            vis_data = _load_visibility_dataset(data_path)
 
         # 转换单位如果需要（从m转换为km）
         if float(vis_data.max(skipna=True).values) > 100:  # 如果最大值大于100，可能是米单位
@@ -98,6 +101,34 @@ def load_visibility_data(data_path: str):
     except Exception as e:
         print(f"  ⚠ 加载数据时出错: {e}")
         return None
+
+
+def _load_visibility_dataset(data_path: str | Path):
+    """加载并关闭一个本地能见度 NetCDF，返回已脱离文件句柄的数据。"""
+    # 国家局产品的 vis000 维度为 time/level/lat/lon。
+    with xr.open_dataset(data_path) as ds:
+        if 'visibility' in ds:
+            vis_data = ds['visibility'].load()
+        elif 'vis000' in ds:
+            vis_data = ds['vis000'][0, 0, :, :].load()
+        else:
+            # 尝试获取第一个数据变量
+            var_name = list(ds.data_vars)[0]
+            vis_data = ds[var_name].load()
+    return vis_data
+
+
+def _download_cldas_file(data_url: str, local_path: Path, timeout_seconds: int = 30) -> None:
+    """将国家局 OPeNDAP 地址转换为 fileServer 地址并下载到本地。"""
+    parsed = urlsplit(data_url)
+    if "/dodsC/" not in parsed.path:
+        raise ValueError(f"无法将国家局数据地址转换为fileServer地址: {data_url}")
+    file_server_url = urlunsplit(
+        parsed._replace(path=parsed.path.replace("/dodsC/", "/fileServer/", 1))
+    )
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    with urlopen(file_server_url, timeout=timeout_seconds) as response, local_path.open("wb") as target:
+        shutil.copyfileobj(response, target)
 
 
 def evaluate_visibility_score(vis_data, df_station):

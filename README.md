@@ -244,6 +244,8 @@ $$d_i = \sqrt{(x_i-x_0)^2 + (y_i-y_0)^2 + \beta^2 (z_i-z_0)^2}, \quad \beta=10$$
 - 区域站：`\\10.148.44.81\surf\idea\getSurfAwstOrg4Prov\{YYYY}\{MM}\SurfAwst_广东_{YYYYMMDDHHmm}00.csv`
 - CLDAS 产品：`http://10.148.8.71:7080/thredds/dodsC/cldas/{YYYYMMDD}/VIS_{YYYYMMDDHH}.NC`
 
+> **TODO：更换国家局 5 km 能见度产品数据源。** 当前产品的主要延迟来自上游数据源，现有绘图与调度逻辑无法从根本上消除该延迟；后续需要接入时效性更稳定的数据源，并同步调整产品地址、读取方式和出图验证流程。
+
 ### 输出路径
 
 | 输出类型 | 路径 | 格式 |

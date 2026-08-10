@@ -30,6 +30,7 @@ _PLOT_EXECUTOR_LOCK = threading.Lock()
 _CLDAS_PLOT_EXECUTOR: ThreadPoolExecutor | None = None
 _CLDAS_PLOT_EXECUTOR_LOCK = threading.Lock()
 _CLDAS_PENDING_OUTPUTS: set[str] = set()
+_CLDAS_PLOT_WORKERS = 2
 _BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 
 
@@ -304,7 +305,10 @@ def run_forever(config: BusinessConfig | None = None) -> None:
         if now.minute in config.schedule_minutes and slot != last_slot:
             last_slot = slot
             # 小时产品也随现有5分钟调度检查；目标图片存在时不会读取远程NC。
-            run_once(now=now, config=config, include_cldas=True)
+            try:
+                run_once(now=now, config=config, include_cldas=True)
+            except Exception:  # noqa: BLE001 - 常驻服务不能因单轮调度异常退出
+                logger.exception("业务调度本轮异常，服务继续运行")
         time.sleep(config.poll_interval_seconds)
 
 
@@ -366,7 +370,10 @@ def _submit_cldas_plot(data_url: str, boundary_path: Path, output_path: Path, ti
     global _CLDAS_PLOT_EXECUTOR
     with _CLDAS_PLOT_EXECUTOR_LOCK:
         if _CLDAS_PLOT_EXECUTOR is None:
-            _CLDAS_PLOT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cldas-visibility-plot")
+            _CLDAS_PLOT_EXECUTOR = ThreadPoolExecutor(
+                max_workers=_CLDAS_PLOT_WORKERS,
+                thread_name_prefix="cldas-visibility-plot",
+            )
         _CLDAS_PLOT_EXECUTOR.submit(_render_cldas_plot_job, data_url, boundary_path, output_path, title)
 
 
