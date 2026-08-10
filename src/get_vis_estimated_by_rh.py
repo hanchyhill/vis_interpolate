@@ -8,6 +8,8 @@ import numpy as np
 from scipy.spatial.distance import cdist
 from datetime import datetime, timedelta
 from pathlib import Path, PureWindowsPath
+from os import path
+from multiprocessing import Pool, cpu_count
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -337,67 +339,102 @@ def estimate_visibility_for_time(time_selected: datetime, output_dir: Path, use_
     return station_vis_all
 
 
+def process_single_time(args):
+    """
+    处理单个时次的能见度估算（用于多进程）
+
+    参数:
+        args: tuple, (time_selected, output_dir, type, index, total)
+
+    返回:
+        dict: 包含处理结果的字典
+    """
+    time_selected, output_dir, type, index, total = args
+    time_str = time_selected.strftime('%Y-%m-%d %H:%M')
+
+    try:
+        # 执行能见度估算
+        station_vis_all = estimate_visibility_for_time(
+            time_selected, output_dir, use_cache=True, type=type
+        )
+
+        if station_vis_all is not None:
+            n_national = len(station_vis_all[station_vis_all['is_vis_est'] == 0])
+            n_regional = len(station_vis_all[station_vis_all['is_vis_est'] == 1])
+            n_estimated = np.sum(~np.isnan(station_vis_all[station_vis_all['is_vis_est'] == 1]['vis']))
+
+            print(f"✓ [{index}/{total}] {time_str} | 国家站: {n_national} | 区域站: {n_regional} | 成功估算: {n_estimated}")
+            return {'success': True, 'time': time_str}
+        else:
+            print(f"✗ [{index}/{total}] {time_str} | 数据不可用")
+            return {'success': False, 'time': time_str}
+    except Exception as e:
+        print(f"✗ [{index}/{total}] {time_str} | 错误: {str(e)}")
+        return {'success': False, 'time': time_str, 'error': str(e)}
+
+
 def main():
     """
-    主函数：循环处理指定日期范围内的能见度估算
+    主函数：并发处理指定日期范围内的能见度估算
     """
     # 定义日期范围
     start_date = datetime(2024, 10, 11, 0, 0)
     end_date = datetime(2025, 10, 11, 0, 0)
 
-    
-    for type in ["national", "national_and_regional"]:
-        # 时间循环
-        current_date = start_date
-        total_hours = int((end_date - start_date).total_seconds() / 3600)
-        processed = 0
-        skipped = 0
+    # 计算CPU核心数
+    num_processes = max(1, cpu_count() - 1)
+
+    for type in ["national_and_regional", "national"]:
         # 定义输出目录
         if type == "national":
-            output_dir = Path(r"H:\github\python\vis_interpolate\data\vis_estimated_base_nation_station")
-            output_dir.mkdir(parents=True, exist_ok=True)
+            output_dir = Path(path.dirname(__file__)) / '../data/vis_estimated_base_nation_station'
         elif type == "national_and_regional":
-            output_dir = Path(r"H:\github\python\vis_interpolate\data\vis_estimated_base_nation_and_regional_station")
-            output_dir.mkdir(parents=True, exist_ok=True)
-        print("=" * 80)
+            output_dir = Path(path.dirname(__file__)) / '../data/vis_estimated_base_nation_and_regional_station'
 
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 生成所有需要处理的时间列表
+        time_list = []
+        current_date = start_date
+        while current_date <= end_date:
+            time_list.append(current_date)
+            current_date += timedelta(hours=1)
+
+        total_hours = len(time_list)
+
+        print("=" * 80)
         print(f"能见度估算（基于国家站插值区域站）")
+        print(f"站点类型: {type}")
         print(f"起始时间: {start_date.strftime('%Y-%m-%d %H:%M')}")
         print(f"结束时间: {end_date.strftime('%Y-%m-%d %H:%M')}")
         print(f"总时次数: {total_hours}")
+        print(f"并发进程数: {num_processes}")
         print(f"输出目录: {output_dir}")
         print("=" * 80)
 
-        while current_date <= end_date:
-            time_str = current_date.strftime('%Y-%m-%d %H:%M')
-            print(f"\n处理时次: {time_str} ({processed + skipped + 1}/{total_hours})", end=" ")
+        # 准备多进程参数
+        args_list = [
+            (time, output_dir, type, idx + 1, total_hours)
+            for idx, time in enumerate(time_list)
+        ]
 
-            # 执行能见度估算
-            station_vis_all = estimate_visibility_for_time(
-                current_date, output_dir, use_cache=True, type=type
-            )
+        # 使用多进程并发处理
+        with Pool(processes=num_processes) as pool:
+            results = pool.map(process_single_time, args_list)
 
-            if station_vis_all is not None:
-                n_national = len(station_vis_all[station_vis_all['is_vis_est'] == 0])
-                n_regional = len(station_vis_all[station_vis_all['is_vis_est'] == 1])
-                n_estimated = np.sum(~np.isnan(station_vis_all[station_vis_all['is_vis_est'] == 1]['vis']))
-
-                print(f"✓ 国家站: {n_national} | 区域站: {n_regional} | 成功估算: {n_estimated}")
-                processed += 1
-            else:
-                print("✗ 数据不可用")
-                skipped += 1
-
-            # 移动到下一个时次（每小时）
-            current_date += timedelta(hours=1)
+        # 统计结果
+        processed = sum(1 for r in results if r['success'])
+        skipped = len(results) - processed
 
         # 输出汇总信息
         print("\n" + "=" * 80)
         print("处理完成!")
+        print(f"站点类型: {type}")
         print(f"成功处理: {processed} 个时次")
         print(f"跳过时次: {skipped} 个")
         print(f"输出目录: {output_dir}")
         print("=" * 80)
+
 
 
 if __name__ == "__main__":
