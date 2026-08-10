@@ -339,6 +339,49 @@ uv run python -m src.business run-once --province 广西
 
 常驻模式会持续运行，在每小时 `02、07、12、17、22、27、32、37、42、47、52、57` 分启动一轮处理。默认距离上游时次 2 分钟后开始处理，最新就绪时次优先，最多补偿 1 个旧时次；图片进入后台单线程队列生成，不阻塞 CSV 和 NetCDF 发布。部署到Windows服务或任务计划时，建议保持 `serve` 进程常驻；手动停止可使用 `Ctrl+C`。
 
+#### 使用 Docker Compose（Linux）
+
+Docker 部署是 PM2 部署之外的独立方式；两者使用同一份数据目录时不要同时运行。Docker 启动失败时，不会修改 `ecosystem.config.cjs`、PM2 进程定义或宿主机数据，可停止容器后直接恢复 PM2。完整的服务器目录、权限、配置、启动、升级、备份、排障和 PM2 回退步骤见 [Docker 服务端部署指南](deploy/docker/README.md)。
+
+服务器需要 Docker Engine 和 Docker Compose v2。以下示例使用 `/srv/vis-interpolate` 保存配置和业务数据：
+
+```bash
+# 仅首次执行：准备持久化目录和配置文件
+sudo mkdir -p /srv/vis-interpolate/config /srv/vis-interpolate/data
+sudo cp src/config/business.docker.config.example.json \
+  /srv/vis-interpolate/config/business.config.json
+sudo chown -R 10001:10001 /srv/vis-interpolate/data /srv/vis-interpolate/config
+sudo chmod 600 /srv/vis-interpolate/config/business.config.json
+
+# 编辑配置中的接口账号密码，并把 DEM 与完整 Shapefile（.shp/.shx/.dbf/.prj）放入 data/assets/
+sudoedit /srv/vis-interpolate/config/business.config.json
+
+# 复制并调整宿主机挂载路径；.env 不应提交
+cp .env.example .env
+
+# 构建并启动
+docker compose build
+docker compose up -d
+docker compose ps
+curl --fail http://127.0.0.1:8181/health/ready
+```
+
+健康接口仅绑定到服务器本机：`/health/live` 用于存活检查，`/health/ready` 会检查 DEM 和数据目录；广东边界文件缺失时返回正常 HTTP 状态但 JSON 中标记为 `degraded`。业务日志保存在挂载目录的 `business/business.log`，容器标准输出可通过以下命令查看：
+
+```bash
+docker compose logs -f vis-interpolate-business
+```
+
+升级时先在仓库更新代码，再执行 `docker compose build && docker compose up -d`。Compose 停止或重建不会删除 bind mount 中的 SQLite 状态和输出文件。
+
+如 Docker 方式不可用，先停止容器，确认没有残留容器进程，再按原 PM2 命令恢复；不要执行会删除数据卷的命令：
+
+```bash
+docker compose down
+pm2 start ecosystem.config.cjs
+pm2 status
+```
+
 #### 使用 PM2 持久化守护
 
 项目根目录提供 [ecosystem.config.cjs](H:\github\python\vis_interpolate\ecosystem.config.cjs)，用于守护业务常驻进程。首次部署时先完成依赖安装，再启动PM2：

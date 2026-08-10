@@ -1,0 +1,49 @@
+services:
+  vis-interpolate-business:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_UID: "10001"
+        APP_GID: "10001"
+    image: vis-interpolate-business:local
+    command:
+      - python
+      - -m
+      - src.business
+      - serve
+      - --config
+      - /run/config/business.config.json
+      - --health-host
+      - 0.0.0.0
+      - --health-port
+      - "8181"
+    environment:
+      TZ: Asia/Shanghai
+      MPLCONFIGDIR: /tmp/matplotlib
+    init: true
+    restart: unless-stopped
+    read_only: true
+    stop_grace_period: 5m
+    ports:
+      - "127.0.0.1:${VIS_HEALTH_PORT:-8181}:8181"
+    volumes:
+      - type: bind
+        source: ${VIS_CONFIG_FILE:?请在 .env 中设置 VIS_CONFIG_FILE}
+        target: /run/config/business.config.json
+        read_only: true
+      - type: bind
+        source: ${VIS_DATA_DIR:?请在 .env 中设置 VIS_DATA_DIR}
+        target: /data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "from urllib.request import urlopen; urlopen('http://127.0.0.1:8181/health/ready', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

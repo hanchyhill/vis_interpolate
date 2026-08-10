@@ -18,6 +18,7 @@ import xarray as xr
 from .algorithms import estimate_both
 from .api import StationBatch, VisibilityApiClient
 from .config import BusinessConfig
+from .health import HealthState
 from .idw import create_visibility_grid
 from .plot import plot_cldas_visibility, plot_visibility
 from .state import PipelineState, process_lock
@@ -294,22 +295,35 @@ def _render_plot_job(nc_path: Path, boundary_path: Path, output_path: Path, titl
         logging.getLogger("vis_interpolate.business").exception("图片生成失败: %s", output_path)
 
 
-def run_forever(config: BusinessConfig | None = None) -> None:
+def run_forever(
+    config: BusinessConfig | None = None,
+    *,
+    stop_event: threading.Event | None = None,
+    health_state: HealthState | None = None,
+) -> None:
     config = config or BusinessConfig.from_file()
     logger = configure_logging(config)
+    stop_event = stop_event or threading.Event()
+    health_state = health_state or HealthState(config)
     last_slot: str | None = None
     logger.info("业务调度启动，分钟表=%s", config.schedule_minutes)
-    while True:
+    health_state.mark_started()
+    while not stop_event.is_set():
         now = datetime.now().astimezone()
         slot = now.strftime("%Y%m%d%H%M")
         if now.minute in config.schedule_minutes and slot != last_slot:
             last_slot = slot
             # 小时产品也随现有5分钟调度检查；目标图片存在时不会读取远程NC。
             try:
+                health_state.mark_processing()
                 run_once(now=now, config=config, include_cldas=True)
+                health_state.mark_cycle_complete()
             except Exception:  # noqa: BLE001 - 常驻服务不能因单轮调度异常退出
+                health_state.mark_cycle_complete("failed")
                 logger.exception("业务调度本轮异常，服务继续运行")
-        time.sleep(config.poll_interval_seconds)
+        stop_event.wait(config.poll_interval_seconds)
+    health_state.mark_stopping()
+    logger.info("业务调度停止")
 
 
 def hourly_visibility_times(now: datetime, sample_count: int = 2) -> list[datetime]:
