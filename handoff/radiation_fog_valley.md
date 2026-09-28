@@ -2,7 +2,7 @@
 
 更新时间：2026-09-28
 需求来源：`prompt.md` 的「新增辐射雾订正算法」一节
-状态：山谷边界算法已定稿；辐射雾订正方案已确认（见 4.4 节），尚未开始实现
+状态：山谷边界算法已定稿；辐射雾订正已实现（见第 5 节），待挑选冬季个例做新旧对比和调参
 
 ---
 
@@ -223,3 +223,71 @@ g(目标点, 雾站) = 1                                   目标点在同一山
 | 虚拟雾站能见度 | 范围内实测雾站能见度的中位数 | 中位数比最小值更稳健 |
 
 仍待确认：暂无。可以进入实现阶段。
+
+---
+
+## 5. 实现情况（2026-09-28）
+
+### 5.1 代码
+
+| 文件 | 内容 |
+|---|---|
+| `src/valley_boundary.py` | 新增 `valley_product()`（合并后山谷按面积加权求雾顶、谷底平均海拔）和 `export_valley_product()`；`--product` 只生成选定配置。原有对比流程和 `fusion_valley_mask()` 输出不变 |
+| `src/business/radiation_fog.py` | 新模块：山谷产品加载、站点归属、雾站判别、虚拟雾站、影响域（谷内 Voronoi + g 衰减）、订正估算、`build_corrected_products()` |
+| `src/business/algorithms.py` | `_estimate_one()` 改为向量化，并可传入权重修正系数；原逐行实现保留为 `_estimate_one_legacy()`。真实数据验证两者逐位一致，耗时从约 2.2 s 降到 0.01 s |
+| `src/business/idw.py` | `create_visibility_grid()` 增加可选参数 `fog_influence`，为空时行为不变 |
+| `src/business/api.py` | 可选字段 `V13019 → pre_1h`；接口不返回该字段时按缺测处理，不报错 |
+| `src/business/config.py` | `RadiationFogSettings`，对应配置段 `radiationFog`；**配置中没有该段时默认关闭**，旧配置行为不变 |
+| `src/business/pipeline.py` | 启用时先按原算法出结果，再生成订正结果；订正出错时记录日志并发布原算法结果 |
+| `src/business/fog_compare.py` | 个例对比工具（见 5.3 节） |
+| `tests/test_radiation_fog.py` | 13 个测试；`tests/test_valley_boundary.py` 新增 3 个测试。全部测试共 50 个，均通过 |
+
+山谷产品：`data/assets/dem/valley_fusion_t20_near_m0.nc`（与 `output/valley_boundary/valley_boundaries.nc` 中的选定配置逐像元一致；全域 114 个山谷，其中广东境内 85 个）。换机器时重新生成：
+
+```bash
+uv run python -m src.valley_boundary --product
+```
+
+### 5.2 计划之外、实现时补充的规则（均可再调整）
+
+1. **按参考路径分别判别**：`national` 路径只用国家站能见度判别雾站和"谷内有无观测"，`national_and_regional` 路径同时使用国家站和区域站。与原算法两条路径的参考站集合保持一致。
+2. **谷内估算出的低能见度站同样受限**：估算值 < `visThresholdM`、位于影响域内且无降水的区域站，同样赋予 `fog_domain_id`，在 IDW 中只在影响域内起作用。否则雾谷内继承了雾站低能见度的估算站会在 IDW 中再次向外扩散。
+3. **估算环节的补位**：候选取最近 8 个参考站，按距离顺序取前 4 个 g > 0 的站。雾站被规避后由更远的站补上，与 IDW 环节的做法一致；没有雾站时仍是最近 4 站，结果与原算法相同。
+4. **d_out 指到影响域的距离**：按谷内 Voronoi 划分之后的影响域计算，不是到整条山谷边界。同谷内非雾站一侧的格点也按距离衰减。
+5. **推断山谷的 Voronoi 种子**：没有能见度观测的山谷，以谷内全部湿度站为种子，其中满足条件的虚拟雾站为雾种子。
+6. **Δz 的海拔来源**：格点使用 IDW 所用的 DEM 海拔，站点使用站点海拔；雾顶取山谷产品中的值（由平滑后的 DEM 算得）。
+
+### 5.3 个例对比
+
+```bash
+# 本地原始 CSV
+uv run python -m src.business.fog_compare --time 202502280000 \
+    --national-csv data/SurfAuto_20250228000000.csv --regional-csv data/SurfAwst_20250228000000.csv
+# 从接口获取（首次获取后缓存到 output/fog_compare/<时次>/input_*.csv，加 --refresh 重新获取）
+uv run python -m src.business.fog_compare --time 202501150000
+# 调参：可用 --sigma-z --sigma-d --g-cutoff --vis-threshold --rh-threshold --infer-radius --precip-missing-as-wet
+uv run python -m src.business.fog_compare --time 202501150000 --sigma-d 3 --tag sd3
+```
+
+输出目录为 `output/fog_compare/<时次>/<参数标签>/`，内容包括：
+- `<路径>_compare.png`：原算法、订正结果、g 场三联图，叠加山谷边界、实测雾站和虚拟雾站；
+- `<路径>.nc`：`visibility`、`visibility_original`、`fog_influence`；
+- `<路径>_stations.csv`：订正后站点表，含 `vis_original`；
+- `stats.csv`：雾站数、影响域数、广东境内能见度 < 500 m 和 < 1 km 的面积（订正前后）。
+
+业务输出（启用时）：NetCDF 中增加 `visibility_original` 和 `fog_influence`，全局属性中记录雾站统计；站点 CSV 中增加 `valley_id`、`is_radiation_fog`（0 = 否，1 = 实测雾站，2 = 虚拟雾站）、`fog_domain_id`、`pre_1h`、`vis_original`；日志的 timings 中增加 `radiation_fog` 统计。
+
+### 5.4 首个个例：2025-02-28 00 UTC（北京时间 08 时）
+
+两条路径都判出 8 个实测雾站、11 个虚拟雾站，共 16 个影响域。
+
+| 路径 | 广东境内 < 1 km 面积（原算法 → 订正） |
+|---|---|
+| national | 15430 → 3016 km² |
+| national_and_regional | 10099 → 3907 km² |
+
+检验结果：
+- 把阈值设为"没有雾站"时，订正结果与原算法逐位一致；
+- 粤西雷州半岛的低能见度不在山谷内，未被改动。
+
+尚未做的事：与卫星可见光云图对照；在更多冬季辐射雾个例、以及降水个例上检验。

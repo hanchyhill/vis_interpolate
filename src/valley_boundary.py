@@ -12,6 +12,7 @@
 用法：
     uv run python -m src.valley_boundary
     uv run python -m src.valley_boundary --out-dir output/valley_boundary
+    uv run python -m src.valley_boundary --product   # 只生成业务用山谷产品
 """
 
 from __future__ import annotations
@@ -308,6 +309,12 @@ def fusion_valley_mask(grid: DemGrid, cfg: ValleyConfig) -> tuple[np.ndarray, np
     山谷 = (TPI 山谷(外扩 widen_px) ∪ unit 谷底核心) ∩ (unit 雾区外扩 reach_px)，
     谷底核心用于补齐宽盆地中心 TPI≈0 的空洞；reach_px 限制 TPI 沿河网无限延伸。
     """
+    labels, _, _ = _fusion_labels(grid, cfg)
+    return labels > 0, labels
+
+
+def _fusion_labels(grid: DemGrid, cfg: ValleyConfig) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """返回 (合并后山谷编号, 合并前单元编号, 单元属性表)，两个编号栅格覆盖相同像元。"""
     tpi = compute_tpi(grid, cfg.radius_km)
     tpi_mask = grid.land & (np.nan_to_num(tpi, nan=np.inf) <= -cfg.threshold_m)
     if cfg.widen_px > 0:
@@ -320,7 +327,7 @@ def fusion_valley_mask(grid: DemGrid, cfg: ValleyConfig) -> tuple[np.ndarray, np
     units, markers, _ = partition
     unit_mask, unit_ids, table = unit_valley_mask(grid, unit_cfg, partition)
     if not unit_mask.any():
-        return unit_mask, unit_ids
+        return unit_ids, unit_ids, table
     reach = unit_mask
     if cfg.reach_px > 0:
         reach = ndi.binary_dilation(unit_mask, structure=STRUCTURE_8, iterations=cfg.reach_px)
@@ -332,7 +339,8 @@ def fusion_valley_mask(grid: DemGrid, cfg: ValleyConfig) -> tuple[np.ndarray, np
         owner = unit_ids[iy, ix]
     else:
         owner = units
-    labels = np.where(mask, owner, 0).astype(np.int32)
+    unit_labels = np.where(mask, owner, 0).astype(np.int32)
+    labels = unit_labels
     if cfg.merge_slack_m is not None:
         fog_top = np.full(int(labels.max()) + 1, -np.inf)
         valid = table["unit_id"].to_numpy() < fog_top.size
@@ -343,7 +351,90 @@ def fusion_valley_mask(grid: DemGrid, cfg: ValleyConfig) -> tuple[np.ndarray, np
     keep = area >= cfg.min_area_km2
     keep[0] = False
     labels = np.where(keep[labels], labels, 0)
-    return labels > 0, labels
+    return labels, np.where(labels > 0, unit_labels, 0), table
+
+
+def valley_product(grid: DemGrid, cfg: ValleyConfig) -> tuple[np.ndarray, pd.DataFrame]:
+    """融合法山谷编号及合并后山谷属性表。
+
+    合并后山谷的谷底平均海拔、雾顶取各成员单元的面积加权平均，
+    权重为该单元在合并后山谷中的像元面积 (km²)。
+    """
+    if cfg.method != "fusion":
+        raise ValueError(f"山谷产品仅支持 fusion 配置: {cfg.name}")
+    labels, unit_labels, table = _fusion_labels(grid, cfg)
+    columns = ["valley_id", "valley_mean_m", "fog_top_m", "area_km2", "center_lat", "center_lon", "member_units"]
+    ids = np.unique(labels[labels > 0])
+    if ids.size == 0 or table.empty:
+        return labels, pd.DataFrame(columns=columns)
+    size = int(max(unit_labels.max(), table["unit_id"].max())) + 1
+    top_lut = np.full(size, np.nan)
+    mean_lut = np.full(size, np.nan)
+    top_lut[table["unit_id"].to_numpy()] = table["fog_top_m"].to_numpy()
+    mean_lut[table["unit_id"].to_numpy()] = table["valley_mean_m"].to_numpy()
+
+    inside = labels > 0
+    area_px = np.broadcast_to(grid.pixel_area_km2, labels.shape)[inside]
+    final = labels[inside]
+    member = unit_labels[inside]
+    lat2d = np.broadcast_to(grid.lat[:, None], labels.shape)[inside]
+    lon2d = np.broadcast_to(grid.lon[None, :], labels.shape)[inside]
+    frame = pd.DataFrame({
+        "valley_id": final, "unit_id": member, "w": area_px,
+        "w_top": area_px * top_lut[member], "w_mean": area_px * mean_lut[member],
+        "w_lat": area_px * lat2d, "w_lon": area_px * lon2d,
+    })
+    grouped = frame.groupby("valley_id")
+    sums = grouped[["w", "w_top", "w_mean", "w_lat", "w_lon"]].sum()
+    result = pd.DataFrame({
+        "valley_id": sums.index.to_numpy(dtype=np.int32),
+        "valley_mean_m": (sums["w_mean"] / sums["w"]).to_numpy(),
+        "fog_top_m": (sums["w_top"] / sums["w"]).to_numpy(),
+        "area_km2": sums["w"].to_numpy(),
+        "center_lat": (sums["w_lat"] / sums["w"]).to_numpy(),
+        "center_lon": (sums["w_lon"] / sums["w"]).to_numpy(),
+        "member_units": grouped["unit_id"].nunique().to_numpy(dtype=np.int32),
+    })
+    return labels, result.reset_index(drop=True)
+
+
+PRODUCT_CONFIG = "fusion_t20_near_m0"
+
+
+def export_valley_product(dem_path: Path, output_path: Path, config_name: str = PRODUCT_CONFIG) -> pd.DataFrame:
+    """只运行选定配置，输出业务用静态山谷产品 NetCDF。
+
+    变量：valley_id(lat, lon)，0=非山谷；按 valley 维存放合并后山谷的属性。
+    """
+    by_name = {c.name: c for c in DEFAULT_CONFIGS}
+    if config_name not in by_name:
+        raise ValueError(f"未知山谷配置: {config_name}")
+    cfg = by_name[config_name]
+    grid = load_dem(dem_path)
+    labels, table = valley_product(grid, cfg)
+    valley = table["valley_id"].to_numpy(dtype=np.int32)
+    ds = xr.Dataset(
+        {
+            "valley_id": (("lat", "lon"), labels.astype(np.int32),
+                          {"long_name": "valley id", "description": "0=非山谷, >0=山谷编号（不连续）"}),
+            "valley_mean_m": ("valley", table["valley_mean_m"].to_numpy(float),
+                              {"units": "m", "long_name": "谷底平均海拔（成员单元面积加权）"}),
+            "fog_top_m": ("valley", table["fog_top_m"].to_numpy(float),
+                          {"units": "m", "long_name": "雾顶海拔（成员单元面积加权）"}),
+            "area_km2": ("valley", table["area_km2"].to_numpy(float), {"units": "km2"}),
+            "center_lat": ("valley", table["center_lat"].to_numpy(float), {"units": "degrees_north"}),
+            "center_lon": ("valley", table["center_lon"].to_numpy(float), {"units": "degrees_east"}),
+            "member_units": ("valley", table["member_units"].to_numpy(np.int32),
+                             {"long_name": "合并前山谷单元数"}),
+        },
+        coords={"lat": grid.lat, "lon": grid.lon, "valley": valley},
+        attrs={"title": "Valley product for radiation fog correction", "config": cfg.name,
+               "config_label": cfg.label, "source_dem": str(dem_path), "crs": "EPSG:4326"},
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ds.to_netcdf(output_path, encoding={"valley_id": {"zlib": True, "complevel": 4}})
+    print(f"[OK] {cfg.name}: {len(table)} 个山谷 -> {output_path.resolve()}")
+    return table
 
 
 def merge_connected_valleys(labels: np.ndarray, grid: DemGrid, fog_top_m: np.ndarray,
@@ -697,7 +788,13 @@ def main() -> None:
     parser.add_argument("--dem", type=Path, default=Path("data/assets/dem/merged_dem_data.nc"))
     parser.add_argument("--boundary", type=Path, default=_default_boundary(), help="广东边界 Shapefile")
     parser.add_argument("--out-dir", type=Path, default=Path("output/valley_boundary"))
+    parser.add_argument("--product", action="store_true", help="只生成业务用山谷产品（选定配置）")
+    parser.add_argument("--product-config", default=PRODUCT_CONFIG)
+    parser.add_argument("--product-path", type=Path, default=Path(f"data/assets/dem/valley_{PRODUCT_CONFIG}.nc"))
     args = parser.parse_args()
+    if args.product:
+        export_valley_product(args.dem, args.product_path, args.product_config)
+        return
     run(args.dem, args.boundary, args.out_dir)
 
 

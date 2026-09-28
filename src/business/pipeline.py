@@ -21,6 +21,7 @@ from .config import BusinessConfig
 from .health import HealthState
 from .idw import create_visibility_grid
 from .plot import plot_cldas_visibility, plot_visibility
+from .radiation_fog import build_corrected_products, load_model as load_radiation_fog_model
 from .state import PipelineState, process_lock
 
 from src.evaluate_visibility import build_filenames_and_urls
@@ -202,6 +203,30 @@ def _build_outputs(
         for source, frame in estimates.items()
     }
     timings["idw_seconds"] = round(time.perf_counter() - idw_started, 3)
+    frames: dict[str, Any] = dict(estimates)
+    nc_objects: dict[str, Any] = dict(grids)
+    logger = logging.getLogger("vis_interpolate.business")
+    fog_started = time.perf_counter()
+    try:
+        with NETCDF_IO_LOCK:
+            fog_model = load_radiation_fog_model(config.radiation_fog, dem, logger)
+        corrected = (
+            build_corrected_products(batch.national, batch.regional, dem, fog_model, estimates, grids)
+            if fog_model is not None else None
+        )
+    except Exception:  # noqa: BLE001 - 订正失败时仍发布原算法结果
+        logger.exception("辐射雾订正失败，本时次退回原算法")
+        corrected = None
+    if corrected is not None:
+        for source, product in corrected.items():
+            frames[source] = product.frame
+            nc_objects[source] = product.dataset
+        timings["radiation_fog_seconds"] = round(time.perf_counter() - fog_started, 3)
+        timings["radiation_fog"] = {source: product.summary for source, product in corrected.items()}
+        missing = max(product.summary["low_vis_in_valley_precip_missing"] for product in corrected.values())
+        if missing:
+            logger.info("辐射雾判别：%s 个山谷低能见度站降水缺测，按%s处理", missing,
+                        "无降水" if config.radiation_fog.precip_missing_as_dry else "有降水")
 
     date_parts = (observation_time.strftime("%Y"), observation_time.strftime("%m"), observation_time.strftime("%d"))
     stamp = observation_time.strftime("%Y%m%d%H%M")
@@ -233,11 +258,11 @@ def _build_outputs(
     with tempfile.TemporaryDirectory(prefix=f"business_{stamp}_", dir=config.state_path.parent) as temp_dir:
         temp = Path(temp_dir)
         staged: list[tuple[Path, Path]] = []
-        for source, frame in estimates.items():
+        for source, frame in frames.items():
             csv_temp = temp / f"{source}.csv"
             nc_temp = temp / f"{source}.nc"
             frame.to_csv(csv_temp, index=False, encoding="utf-8-sig")
-            grids[source].attrs.update(
+            nc_objects[source].attrs.update(
                 {
                     "observation_time_utc": observation_time.astimezone(timezone.utc).isoformat(),
                     "generated_at_utc": generated_at,
@@ -249,7 +274,7 @@ def _build_outputs(
                 }
             )
             with NETCDF_IO_LOCK:
-                grids[source].to_netcdf(nc_temp)
+                nc_objects[source].to_netcdf(nc_temp)
             staged.extend([(csv_temp, csv_paths[source]), (nc_temp, nc_paths[source])])
         for source_temp, destination in staged:
             source_temp.replace(destination)

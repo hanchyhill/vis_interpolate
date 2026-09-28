@@ -21,5 +21,17 @@
   "latestFirst": true,
   "maxBackfillSlotsPerCycle": 1,
   "asyncPlots": true,
-  "pollIntervalSeconds": 5
+  "pollIntervalSeconds": 5,
+  "radiationFog": {
+    "enabled": true,
+    "valleyPath": "data/assets/dem/valley_fusion_t20_near_m0.nc",
+    "visThresholdM": 500,
+    "rhThresholdPct": 95,
+    "precipThresholdMm": 0,
+    "precipMissingAsDry": true,
+    "sigmaZM": 50,
+    "sigmaDKm": 2,
+    "gCutoff": 0.05,
+    "inferRadiusKm": 50
+  }
 }

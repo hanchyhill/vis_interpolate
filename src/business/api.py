@@ -27,6 +27,8 @@ _COMMON_FIELDS = [
 ]
 _NATIONAL_FIELDS = _COMMON_FIELDS + ["V20001"]
 _REGIONAL_FIELDS = _COMMON_FIELDS + ["V20001_701_01"]
+# 缺少时按缺测处理，不影响原有字段校验。
+_OPTIONAL_FIELDS = {"V13019": "pre_1h"}
 
 
 @dataclass
@@ -276,6 +278,8 @@ def _parse_response(
         if fallback_field in frame.columns:
             visibility = visibility.fillna(frame[fallback_field])
     selected[visibility_field] = visibility
+    for source_field, target in _OPTIONAL_FIELDS.items():
+        selected[target] = frame[source_field] if source_field in frame.columns else np.nan
     if "D_UPDATE_TIME" in frame.columns:
         selected["_update_time"] = pd.to_datetime(
             frame["D_UPDATE_TIME"], format="mixed", errors="coerce"
@@ -288,7 +292,7 @@ def _parse_response(
         }
     )
     frame["code"] = _normalize_codes(frame["code"])
-    for col in ["lon", "lat", "altitude", "rh", "vis"]:
+    for col in ["lon", "lat", "altitude", "rh", "vis", *_OPTIONAL_FIELDS.values()]:
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
         frame.loc[frame[col].isin([9999, 999999]), col] = np.nan
     frame = frame.dropna(subset=["code"]).reset_index(drop=True)

@@ -32,6 +32,39 @@ class ApiSettings:
 
 
 @dataclass(frozen=True)
+class RadiationFogSettings:
+    """山谷辐射雾订正参数；enabled=False 时整条流程退回原算法。"""
+
+    enabled: bool = False
+    valley_path: Path = Path("data/assets/dem/valley_fusion_t20_near_m0.nc")
+    vis_threshold_m: float = 500.0
+    rh_threshold_pct: float = 95.0
+    precip_threshold_mm: float = 0.0
+    precip_missing_as_dry: bool = True
+    sigma_z_m: float = 50.0
+    sigma_d_km: float = 2.0
+    g_cutoff: float = 0.05
+    infer_radius_km: float = 50.0
+
+    @classmethod
+    def from_mapping(cls, values: dict[str, Any] | None, root: Path) -> "RadiationFogSettings":
+        values = values or {}
+        default = cls()
+        return cls(
+            enabled=bool(values.get("enabled", default.enabled)),
+            valley_path=_resolve_path(values.get("valleyPath", default.valley_path), root),
+            vis_threshold_m=float(values.get("visThresholdM", default.vis_threshold_m)),
+            rh_threshold_pct=float(values.get("rhThresholdPct", default.rh_threshold_pct)),
+            precip_threshold_mm=float(values.get("precipThresholdMm", default.precip_threshold_mm)),
+            precip_missing_as_dry=bool(values.get("precipMissingAsDry", default.precip_missing_as_dry)),
+            sigma_z_m=float(values.get("sigmaZM", default.sigma_z_m)),
+            sigma_d_km=float(values.get("sigmaDKm", default.sigma_d_km)),
+            g_cutoff=float(values.get("gCutoff", default.g_cutoff)),
+            infer_radius_km=float(values.get("inferRadiusKm", default.infer_radius_km)),
+        )
+
+
+@dataclass(frozen=True)
 class BusinessConfig:
     repo_root: Path
     api: ApiSettings
@@ -55,6 +88,7 @@ class BusinessConfig:
     max_backfill_slots_per_cycle: int = 1
     async_plots: bool = True
     poll_interval_seconds: int = 5
+    radiation_fog: RadiationFogSettings = field(default_factory=RadiationFogSettings)
 
     @classmethod
     def from_file(
@@ -138,6 +172,7 @@ class BusinessConfig:
             max_backfill_slots_per_cycle=max(0, int(values.get("maxBackfillSlotsPerCycle", 1))),
             async_plots=bool(values.get("asyncPlots", True)),
             poll_interval_seconds=max(1, int(values.get("pollIntervalSeconds", 5))),
+            radiation_fog=RadiationFogSettings.from_mapping(values.get("radiationFog"), root),
         )
 
 
