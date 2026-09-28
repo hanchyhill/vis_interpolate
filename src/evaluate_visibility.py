@@ -16,6 +16,8 @@ from urllib.request import urlopen
 import warnings
 warnings.filterwarnings('ignore')
 
+from src.netcdf_io import NETCDF_IO_LOCK
+
 
 def build_filenames_and_urls(ts: datetime, province: str = "广东") -> Dict[str, Dict[str, str]]:
     """
@@ -106,15 +108,16 @@ def load_visibility_data(data_path: str):
 def _load_visibility_dataset(data_path: str | Path):
     """加载并关闭一个本地能见度 NetCDF，返回已脱离文件句柄的数据。"""
     # 国家局产品的 vis000 维度为 time/level/lat/lon。
-    with xr.open_dataset(data_path) as ds:
-        if 'visibility' in ds:
-            vis_data = ds['visibility'].load()
-        elif 'vis000' in ds:
-            vis_data = ds['vis000'][0, 0, :, :].load()
-        else:
-            # 尝试获取第一个数据变量
-            var_name = list(ds.data_vars)[0]
-            vis_data = ds[var_name].load()
+    with NETCDF_IO_LOCK:
+        with xr.open_dataset(data_path) as ds:
+            if 'visibility' in ds:
+                vis_data = ds['visibility'].load()
+            elif 'vis000' in ds:
+                vis_data = ds['vis000'][0, 0, :, :].load()
+            else:
+                # 尝试获取第一个数据变量
+                var_name = list(ds.data_vars)[0]
+                vis_data = ds[var_name].load()
     return vis_data
 
 

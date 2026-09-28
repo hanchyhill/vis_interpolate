@@ -24,6 +24,7 @@ from .plot import plot_cldas_visibility, plot_visibility
 from .state import PipelineState, process_lock
 
 from src.evaluate_visibility import build_filenames_and_urls
+from src.netcdf_io import NETCDF_IO_LOCK
 
 
 _PLOT_EXECUTOR: ThreadPoolExecutor | None = None
@@ -90,6 +91,9 @@ def run_once(
         if not acquired:
             logger.warning("已有业务任务执行中，本轮跳过")
             return [{"status": "lock_skipped"}]
+        interrupted = state.requeue_interrupted()
+        if interrupted:
+            logger.warning("恢复 %s 个中断的历史时次", interrupted)
         current = now or datetime.now().astimezone()
         candidates = window_times(current, config.source_ready_delay_minutes)
         if not candidates:
@@ -190,11 +194,13 @@ def _build_outputs(
     if not config.dem_path.exists():
         raise FileNotFoundError(f"DEM文件不存在: {config.dem_path}")
     idw_started = time.perf_counter()
-    with xr.open_dataset(config.dem_path) as dem:
-        grids = {
-            source: create_visibility_grid(frame, dem)
-            for source, frame in estimates.items()
-        }
+    with NETCDF_IO_LOCK:
+        with xr.open_dataset(config.dem_path) as dem_file:
+            dem = dem_file.load()
+    grids = {
+        source: create_visibility_grid(frame, dem)
+        for source, frame in estimates.items()
+    }
     timings["idw_seconds"] = round(time.perf_counter() - idw_started, 3)
 
     date_parts = (observation_time.strftime("%Y"), observation_time.strftime("%m"), observation_time.strftime("%d"))
@@ -242,7 +248,8 @@ def _build_outputs(
                     "station_count": int(len(frame)),
                 }
             )
-            grids[source].to_netcdf(nc_temp)
+            with NETCDF_IO_LOCK:
+                grids[source].to_netcdf(nc_temp)
             staged.extend([(csv_temp, csv_paths[source]), (nc_temp, nc_paths[source])])
         for source_temp, destination in staged:
             source_temp.replace(destination)

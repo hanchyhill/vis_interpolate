@@ -149,6 +149,17 @@ class BusinessPipelineTests(unittest.TestCase):
             claimed_next = state.claim_backfill(exclude=times[-1], limit=1)
             self.assertEqual(claimed_next, [times[0]])
 
+    def test_state_requeues_interrupted_backfill(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state = PipelineState(Path(directory) / "state.sqlite")
+            oldest = datetime(2026, 8, 5, 7, 50, tzinfo=timezone.utc)
+            latest = datetime(2026, 8, 5, 7, 55, tzinfo=timezone.utc)
+            state.enqueue([oldest, latest])
+            self.assertEqual(state.claim_backfill(exclude=latest, limit=1), [oldest])
+            self.assertEqual(state.claim_backfill(exclude=latest, limit=1), [])
+            self.assertEqual(state.requeue_interrupted(), 1)
+            self.assertEqual(state.claim_backfill(exclude=latest, limit=1), [oldest])
+
     def test_province_override_accepts_chinese_comma(self) -> None:
         config = BusinessConfig.from_file(provinces="广东，广西")
         self.assertEqual(config.api.requested_provinces(), ("广东", "广西"))

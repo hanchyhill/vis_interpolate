@@ -20,6 +20,7 @@ from matplotlib.colors import BoundaryNorm, ListedColormap, LinearSegmentedColor
 from shapely import contains_xy
 
 from src.evaluate_visibility import load_visibility_data
+from src.netcdf_io import NETCDF_IO_LOCK
 
 
 def _configure_fonts() -> bool:
@@ -84,11 +85,12 @@ def plot_visibility(
 ) -> Path:
     """读取一个IDW NetCDF，应用广东遮罩并保存PNG。"""
     boundary = load_guangdong_boundary(boundary_path)
-    with xr.open_dataset(nc_path) as dataset:
-        if "visibility" not in dataset:
-            raise ValueError(f"NetCDF缺少visibility变量: {nc_path}")
-        visibility = dataset["visibility"].load()
-        units = str(visibility.attrs.get("units", "m")).lower()
+    with NETCDF_IO_LOCK:
+        with xr.open_dataset(nc_path) as dataset:
+            if "visibility" not in dataset:
+                raise ValueError(f"NetCDF缺少visibility变量: {nc_path}")
+            visibility = dataset["visibility"].load()
+            units = str(visibility.attrs.get("units", "m")).lower()
     if units in {"m", "meter", "meters"}:
         visibility = visibility / 1000.0
     masked = apply_guangdong_mask(visibility, boundary)

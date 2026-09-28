@@ -137,6 +137,20 @@ class PipelineState:
                 [(_time_key(value), now) for value in observation_times],
             )
 
+    def requeue_interrupted(self) -> int:
+        """Retry slots left in processing when a previous run was interrupted.
+
+        Call only while holding the process lock, so no active run owns them.
+        """
+        with self._connection() as conn:
+            result = conn.execute(
+                """UPDATE observation_queue
+                   SET status='pending', error=NULL, updated_at=?
+                   WHERE status='processing'""",
+                (_now(),),
+            )
+        return result.rowcount
+
     def claim_backfill(self, *, exclude: datetime, limit: int) -> list[datetime]:
         if limit <= 0:
             return []
