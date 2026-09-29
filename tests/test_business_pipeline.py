@@ -23,6 +23,7 @@ from src.business.api import (
 )
 from src.business.config import DEFAULT_PROVINCES, ApiSettings, BusinessConfig
 from src.business.idw import create_visibility_grid
+from src.business import plot as plot_module
 from src.business.plot import _visibility_colormap, _visibility_norm, plot_cldas_visibility, plot_visibility
 from src.business.pipeline import (
     close_logging,
@@ -360,6 +361,18 @@ class BusinessPipelineTests(unittest.TestCase):
             output = plot_visibility(nc_path, boundary_path, root / "images" / "result.png")
             self.assertTrue(output.exists())
             self.assertGreater(output.stat().st_size, 0)
+
+            stations_path = root / "stations.csv"
+            pd.DataFrame({
+                "code": ["A", "B", "C"], "lon": [113.3, 113.6, 113.8], "lat": [23.3, 23.6, 23.8],
+                "is_radiation_fog": [1, 2, 0],
+            }).to_csv(stations_path, index=False)
+            with patch("src.business.plot._plot_fog_stations", wraps=plot_module._plot_fog_stations) as marker:
+                marked = plot_visibility(nc_path, boundary_path, root / "images" / "fog.png",
+                                         stations_path=stations_path)
+            self.assertTrue(marked.exists())
+            marked_stations = marker.call_args.args[1]
+            self.assertEqual(marked_stations["is_radiation_fog"].tolist(), [1, 2, 0])
 
     def test_visibility_colormap_has_breaks_at_fog_thresholds(self) -> None:
         cmap = _visibility_colormap()

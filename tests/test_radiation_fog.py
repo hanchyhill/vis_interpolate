@@ -19,7 +19,7 @@ from src.business.radiation_fog import (
     FOG_INFERRED,
     FOG_OBSERVED,
     RadiationFogModel,
-    ValleyProduct,
+    blend_fog_grid,
     build_corrected_products,
 )
 
@@ -182,6 +182,61 @@ class RadiationFogTests(unittest.TestCase):
         self.assertLess(original[25, 50], without[25, 50])
         self.assertEqual(with_fog[25, 15], original[25, 15])
 
+    def test_blend_fills_domain_with_fog_and_keeps_base_far_away(self) -> None:
+        reference = _stations([("F1", 25, 15, 100.0, 98, 200.0, 0.0), *GOOD])
+        corrected = self.model.estimate(reference, reference.iloc[:0])
+        stations = corrected.frame
+        blended = blend_fog_grid(stations, self.dem, corrected.influence).values
+        base = create_visibility_grid(stations[stations.code != "F1"], self.dem).values
+        g = corrected.influence.max_field(fill_domain=True)
+        domain = self.model.product.valley_id == 5
+        np.testing.assert_array_equal(g[domain], 1.0)
+        np.testing.assert_allclose(blended[domain], 200.0)
+        self.assertAlmostEqual(blended[25, 50], base[25, 50])
+        edge = (25, 27)
+        expected = 200.0 ** float(g[edge]) * base[edge] ** (1 - float(g[edge]))
+        np.testing.assert_allclose(blended[edge], expected, rtol=1e-5)
+        self.assertLess(blended[edge], base[edge])
+        linear = blend_fog_grid(stations, self.dem, corrected.influence, linear=True).values
+        g_linear = corrected.influence.max_field()
+        self.assertAlmostEqual(linear[edge], g_linear[edge] * 200.0 + (1 - g_linear[edge]) * base[edge], places=2)
+        self.assertGreater(linear[edge], blended[edge])
+        weighted = create_visibility_grid(stations, self.dem, fog_influence=corrected.influence).values
+        self.assertGreater(weighted[10, 5], 1000.0)
+
+    def test_blend_depth_lowest_at_valley_floor(self) -> None:
+        dem = self.dem.copy(deep=True)
+        slope = np.linspace(190.0, 90.0, 21)  # 5 号谷自西向东加深
+        dem["elevation"].values[10:41, 5:26] = slope[None, :]
+        model = RadiationFogModel.load(dataclasses.replace(self.settings, fill_mode="blend_depth"), dem)
+        reference = _stations([("F1", 25, 15, float(slope[10]), 98, 200.0, 0.0), *GOOD])
+        corrected = model.estimate(reference, reference.iloc[:0])
+        grid = blend_fog_grid(corrected.frame, dem, corrected.influence, depth=True).values
+        row = grid[25, 5:26]
+        self.assertAlmostEqual(float(grid[25, 15]), 200.0, places=3)
+        self.assertTrue(np.all(np.diff(row) <= 0))
+        self.assertTrue(np.all(np.diff(row[:-2]) < 0))
+        self.assertLess(row[-1], 200.0)
+        self.assertGreater(row[0], 500.0)
+        self.assertLessEqual(row[0], 1000.0)
+        flat = blend_fog_grid(corrected.frame, dem, corrected.influence).values
+        np.testing.assert_allclose(flat[10:41, 5:26], 200.0)
+        self.assertAlmostEqual(float(grid[25, 50]), float(flat[25, 50]))
+
+    def test_fill_mode_selects_grid_method(self) -> None:
+        national = _stations([("F1", 25, 15, 100.0, 98, 200.0, 0.0), *GOOD])
+        regional = _stations([("R1", 25, 40, 150.0, 80.0, np.nan, 0.0)])
+        estimates = estimate_both(national, regional)
+        grids = {source: create_visibility_grid(frame, self.dem) for source, frame in estimates.items()}
+        blend = build_corrected_products(national, regional, self.dem, self.model, estimates, grids)
+        weight = build_corrected_products(national, regional, self.dem, self._model(fill_mode="weight"),
+                                          estimates, grids)
+        self.assertAlmostEqual(float(blend["national"].dataset["visibility"].values[10, 5]), 200.0)
+        self.assertGreater(float(weight["national"].dataset["visibility"].values[10, 5]), 1000.0)
+        self.assertEqual(blend["national"].dataset.attrs["fill_mode"], "blend_depth")
+        with self.assertRaises(ValueError):
+            RadiationFogSettings(fill_mode="other")
+
     def test_no_fog_matches_original_bitwise(self) -> None:
         national = _stations(GOOD)
         regional = _stations([("R1", 25, 15, 100.0, 97.0, np.nan, 0.0), ("R2", 20, 60, 100.0, 60.0, 8000.0, 0.0)])
@@ -227,47 +282,104 @@ class RadiationFogTests(unittest.TestCase):
             path = root / "config.json"
             path.write_text(json.dumps({"userId": "u", "pwd": "p", "radiationFog": {
                 "enabled": True, "valleyPath": "v.nc", "sigmaDKm": 3, "rhThresholdPct": 97,
-                "precipMissingAsDry": False,
+                "precipMissingAsDry": False, "fillMode": "weight",
             }}), encoding="utf-8")
             settings = BusinessConfig.from_file(path, repo_root=root).radiation_fog
             self.assertTrue(settings.enabled)
             self.assertEqual(settings.valley_path, (root / "v.nc").resolve())
             self.assertEqual((settings.sigma_d_km, settings.rh_threshold_pct), (3.0, 97.0))
             self.assertFalse(settings.precip_missing_as_dry)
+            self.assertEqual(settings.fill_mode, "weight")
             self.assertEqual(settings.sigma_z_m, 50.0)
+            config = BusinessConfig.from_file(path, repo_root=root)
+            self.assertEqual(config.radiation_fog_nc_root, (root / "data" / "idw_nc_radiation_fog").resolve())
+            self.assertEqual(config.radiation_fog_img_root, (root / "data" / "vis_img_radiation_fog").resolve())
+            path.write_text(json.dumps({"userId": "u", "pwd": "p", "dataRoot": "d", "radiationFog": {
+                "ncRoot": "fog/nc", "imgRoot": str(root / "abs_img")}}), encoding="utf-8")
+            config = BusinessConfig.from_file(path, repo_root=root)
+            self.assertEqual(config.radiation_fog_nc_root, (root / "d" / "fog" / "nc").resolve())
+            self.assertEqual(config.radiation_fog_img_root, root / "abs_img")
             path.write_text(json.dumps({"userId": "u", "pwd": "p"}), encoding="utf-8")
             self.assertFalse(BusinessConfig.from_file(path, repo_root=root).radiation_fog.enabled)
 
-    def test_build_outputs_writes_original_and_corrected_fields(self) -> None:
-        from src.business import pipeline
-
+    def _pipeline_case(self, settings: RadiationFogSettings):
         root = Path(self.tmp.name)
         dem_path = root / "dem.nc"
-        self.dem.to_netcdf(dem_path)
+        if not dem_path.exists():
+            self.dem.to_netcdf(dem_path)
         data = root / "data"
         config = BusinessConfig(
             repo_root=root, api=ApiSettings(user_id="u", password="p"), dem_path=dem_path,
             state_path=data / "state.sqlite", lock_path=data / "lock", log_path=data / "log.txt",
             csv_national_root=data / "csv-n", csv_combined_root=data / "csv-c",
             nc_national_root=data / "nc-n", nc_combined_root=data / "nc-c", vis_img_root=data / "img",
-            guangdong_boundary_path=root / "missing.shp", async_plots=False, radiation_fog=self.settings,
+            guangdong_boundary_path=root / "missing.shp", async_plots=False, radiation_fog=settings,
+            radiation_fog_nc_root=data / "fog-nc", radiation_fog_img_root=data / "fog-img",
         )
-        data.mkdir(parents=True)
+        data.mkdir(parents=True, exist_ok=True)
         national = _stations([("F1", 25, 15, 100.0, 98, 200.0, 0.0), *GOOD])
         regional = _stations([("R1", 25, 35, 150.0, 98.0, np.nan, 0.0), ("R2", 25, 65, 120.0, 97.0, np.nan, 0.0)])
-        batch = StationBatch(national, regional, {"national": 5, "regional": 2})
+        return config, StationBatch(national, regional, {"national": 5, "regional": 2})
+
+    def test_build_outputs_keeps_original_and_writes_fog_separately(self) -> None:
+        from src.business import pipeline
+
+        config, batch = self._pipeline_case(self.settings)
+        observation_time = datetime(2026, 1, 5, 22, 0, tzinfo=timezone.utc)
         timings: dict = {}
-        outputs = pipeline._build_outputs(datetime(2026, 1, 5, 22, 0, tzinfo=timezone.utc), batch, config, timings)
-        nc_path = next(Path(p) for p in outputs if p.endswith(".nc") and "nc-c" in p)
-        with xr.open_dataset(nc_path) as ds:
+        outputs = pipeline._build_outputs(observation_time, batch, config, timings)
+        original_nc = next(Path(p) for p in outputs if p.endswith(".nc") and "nc-c" in p)
+        with xr.open_dataset(original_nc) as ds:
+            self.assertEqual(set(ds.data_vars), {"visibility"})
+            original_vis = ds["visibility"].values.copy()
+        original_csv = pd.read_csv(next(Path(p) for p in outputs if p.endswith(".csv") and "csv-c" in p))
+        self.assertNotIn("is_radiation_fog", original_csv)
+        expected = create_visibility_grid(estimate_both(batch.national, batch.regional)["national_and_regional"],
+                                          self.dem).values
+        np.testing.assert_array_equal(original_vis, expected)
+
+        paths = pipeline.radiation_fog_paths(config, observation_time)
+        fog_nc = paths["nc"]["national_and_regional"]
+        self.assertIn(str(fog_nc), outputs)
+        self.assertTrue(str(fog_nc).startswith(str(config.radiation_fog_nc_root)))
+        with xr.open_dataset(fog_nc) as ds:
             self.assertEqual(set(ds.data_vars), {"visibility", "visibility_original", "fog_influence"})
             self.assertEqual(ds["visibility"].attrs["units"], "m")
             self.assertEqual(float(ds["fog_influence"].max()), 1.0)
-        csv_path = next(Path(p) for p in outputs if p.endswith(".csv") and "csv-c" in p)
-        frame = pd.read_csv(csv_path)
+            self.assertEqual(ds.attrs["fill_mode"], "blend_depth")
+            self.assertEqual(ds.attrs["source_type"], "national_and_regional")
+            np.testing.assert_array_equal(ds["visibility_original"].values, original_vis)
+            self.assertLess(float(ds["visibility"].values[25, 15]), float(original_vis[25, 15]) + 1e-6)
+        fog_csv = pd.read_csv(paths["csv"]["national_and_regional"])
         for column in ("valley_id", "is_radiation_fog", "fog_domain_id", "vis_original"):
-            self.assertIn(column, frame)
+            self.assertIn(column, fog_csv)
         self.assertEqual(timings["radiation_fog"]["national_and_regional"]["fog_observed"], 1)
+        pipeline.close_logging()
+
+    def test_build_outputs_fog_failure_keeps_original(self) -> None:
+        from unittest import mock
+
+        from src.business import pipeline
+
+        config, batch = self._pipeline_case(self.settings)
+        timings: dict = {}
+        with mock.patch.object(pipeline, "build_corrected_products", side_effect=RuntimeError("boom")):
+            outputs = pipeline._build_outputs(datetime(2026, 1, 5, 22, 0, tzinfo=timezone.utc), batch, config, timings)
+        self.assertEqual(len(outputs), 4)
+        self.assertTrue(all(Path(p).exists() for p in outputs))
+        self.assertTrue(timings["radiation_fog_error"])
+        self.assertFalse(config.radiation_fog_nc_root.exists())
+        pipeline.close_logging()
+
+    def test_build_outputs_disabled_writes_no_fog_products(self) -> None:
+        from src.business import pipeline
+
+        config, batch = self._pipeline_case(dataclasses.replace(self.settings, enabled=False))
+        timings: dict = {}
+        outputs = pipeline._build_outputs(datetime(2026, 1, 5, 22, 0, tzinfo=timezone.utc), batch, config, timings)
+        self.assertEqual(len(outputs), 4)
+        self.assertNotIn("radiation_fog_seconds", timings)
+        self.assertFalse(config.radiation_fog_nc_root.exists())
         pipeline.close_logging()
 
 

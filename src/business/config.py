@@ -12,6 +12,7 @@ from typing import Any
 
 
 DEFAULT_PROVINCES = ("广东", "广西", "湖南", "江西", "福建", "海南")
+FILL_MODES = ("blend", "blend_depth", "blend_linear", "weight")
 
 
 @dataclass(frozen=True)
@@ -37,7 +38,7 @@ class RadiationFogSettings:
 
     enabled: bool = False
     valley_path: Path = Path("data/assets/dem/valley_fusion_t20_near_m0.nc")
-    vis_threshold_m: float = 500.0
+    vis_threshold_m: float = 1000.0
     rh_threshold_pct: float = 95.0
     precip_threshold_mm: float = 0.0
     precip_missing_as_dry: bool = True
@@ -45,6 +46,14 @@ class RadiationFogSettings:
     sigma_d_km: float = 2.0
     g_cutoff: float = 0.05
     infer_radius_km: float = 50.0
+    # blend：影响域内只用本域雾站插值且 g=1，域外按 g 与去掉雾站的基底场做对数混合；
+    # blend_linear：同上但线性混合，域内保留垂直衰减；
+    # weight：仅在 IDW 中给雾站权重乘 g（最初方案）。
+    fill_mode: str = "blend_depth"
+
+    def __post_init__(self) -> None:
+        if self.fill_mode not in FILL_MODES:
+            raise ValueError(f"radiationFog.fillMode 仅支持 {FILL_MODES}: {self.fill_mode}")
 
     @classmethod
     def from_mapping(cls, values: dict[str, Any] | None, root: Path) -> "RadiationFogSettings":
@@ -61,6 +70,7 @@ class RadiationFogSettings:
             sigma_d_km=float(values.get("sigmaDKm", default.sigma_d_km)),
             g_cutoff=float(values.get("gCutoff", default.g_cutoff)),
             infer_radius_km=float(values.get("inferRadiusKm", default.infer_radius_km)),
+            fill_mode=str(values.get("fillMode", default.fill_mode)),
         )
 
 
@@ -89,6 +99,9 @@ class BusinessConfig:
     async_plots: bool = True
     poll_interval_seconds: int = 5
     radiation_fog: RadiationFogSettings = field(default_factory=RadiationFogSettings)
+    # 辐射雾订正产品单独发布，原算法产品保持不变，便于并行对比。
+    radiation_fog_nc_root: Path = Path("data/idw_nc_radiation_fog")
+    radiation_fog_img_root: Path = Path("data/vis_img_radiation_fog")
 
     @classmethod
     def from_file(
@@ -152,6 +165,7 @@ class BusinessConfig:
         selected_dem = _resolve_path(dem_path, root) if dem_path else _resolve_path(
             values.get("demPath", default_dem), root
         )
+        fog_values = values.get("radiationFog") or {}
         return cls(
             repo_root=root,
             api=api,
@@ -172,7 +186,13 @@ class BusinessConfig:
             max_backfill_slots_per_cycle=max(0, int(values.get("maxBackfillSlotsPerCycle", 1))),
             async_plots=bool(values.get("asyncPlots", True)),
             poll_interval_seconds=max(1, int(values.get("pollIntervalSeconds", 5))),
-            radiation_fog=RadiationFogSettings.from_mapping(values.get("radiationFog"), root),
+            radiation_fog=RadiationFogSettings.from_mapping(fog_values, root),
+            radiation_fog_nc_root=_configured_data_path(
+                fog_values, "ncRoot", data_root / "idw_nc_radiation_fog", data_root
+            ),
+            radiation_fog_img_root=_configured_data_path(
+                fog_values, "imgRoot", data_root / "vis_img_radiation_fog", data_root
+            ),
         )
 
 

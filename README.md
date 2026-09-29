@@ -65,6 +65,7 @@ flowchart TD
 | ③ IDW 插值 | `src/vis_dem_dis.py` | 站点 CSV + DEM 海拔 → `visibility_anisotropic_idw_{time}.nc` |
 | ④ 调试可视化 | `debug_visibility_visualization.py` | **CLDAS 在线数据 或 本地 IDW NC** + 广东边界 → 综合对比图 |
 | ⑤ 模型评估 | `src/evaluate_visibility_model.py` | IDW 结果 vs CLDAS 产品 → 评分 CSV |
+| ⑥ 山谷辐射雾订正（业务，对比测试） | `src/business/radiation_fog.py` | 站点能见度/湿度/降水 + 山谷产品 + DEM → 订正 NetCDF / CSV / 图片（与原算法并行输出） |
 
 > **调试可视化数据来源说明**：`debug_visibility_comprehensive.png` 的直接数据来源取决于 `load_visibility_data()` 传入参数——当前 `main()` 传入的是**内网 CLDAS 5km 能见度产品 URL**（`http://10.148.8.71:7080/thredds/dodsC/cldas/{YYYYMMDD}/VIS_{YYYYMMDDHH}.NC`）；若使用默认参数，则来源为**本地各向异性 IDW 插值结果**（`visibility_anisotropic_idw.nc`）。图中的广东省边界遮罩来自省界 Shapefile。
 
@@ -228,6 +229,19 @@ $$d_i = \sqrt{(x_i-x_0)^2 + (y_i-y_0)^2 + \beta^2 (z_i-z_0)^2}, \quad \beta=10$$
 ### 5. 地形位置指数分析（src/tpi_ridge_valley.py）
 基于 TPI 的山脊/山谷自动识别，支持分位数 / Z-score / MAD 三种阈值方案。
 
+### 6. 山谷辐射雾订正（src/business/radiation_fog.py）
+原算法在山区容易把谷内的大雾"摊平"：谷外能见度好的站会压制谷内雾站，雾站的低值又会越过山脊外溢。订正算法利用山谷产品（`src/valley_boundary.py` 生成的 `fusion_t20_near_m0`，含每个山谷的雾顶海拔），把雾限制在山谷内，并按谷底深度渐变。
+
+1. **雾站判别**：谷内站（站点海拔不高于雾顶）能见度 < 1000 m，且 1 小时降水为 0，判为实测雾站。没有能见度观测的山谷里，若有湿度站 RH ≥ 95%、无降水，且 50 km 内有实测雾站，则判为虚拟雾站。
+2. **影响域**：雾站所在山谷内的 Voronoi 区域。域外按 $g = e^{-\Delta z/\sigma_z} \cdot e^{-d/\sigma_d}$ 衰减（$\sigma_z$ = 50 m，$\sigma_d$ = 2 km，$g$ < 0.05 截断）。
+3. **格点合成（`blend_depth`，默认）**：基底场由去掉雾域站后的原 IDW 得到。雾场只用本域雾站插值，再按相对深度渐变：
+
+$$V_{fog}' = V_{edge}\left(\frac{V_{fog}}{V_{edge}}\right)^{\min(r/\bar r,\,2)},\quad r = \frac{z_{top}-z}{z_{top}-z_{floor}},\quad V_{edge}=\max(1000,\,V_{fog})$$
+
+   即谷底最低，在雾站深度处等于观测值，到谷缘升到 1000 m。最后做对数混合 $V = V_{fog}'^{\,g}\,V_{base}^{\,1-g}$，域内 $g$ = 1，因此雾区边缘与山谷边界吻合。
+
+订正产品与原算法产品**并行发布、互不影响**，详见下文[山谷辐射雾订正](#山谷辐射雾订正对比测试中)。设计与验证记录见 `handoff/radiation_fog_valley.md`、`handoff/radiation_fog_delivery.md`、`handoff/radiation_fog_blend_depth_202609290749.md`。
+
 ## 数据源与输出路径
 
 ### 数据源
@@ -252,6 +266,9 @@ $$d_i = \sqrt{(x_i-x_0)^2 + (y_i-y_0)^2 + \beta^2 (z_i-z_0)^2}, \quad \beta=10$$
 |---|---|---|
 | 估算站点能见度 | `data/vis_estimated_base_nation_station/` | CSV |
 | IDW 插值结果 | `data/idw_nc/` | NetCDF |
+| 辐射雾订正结果（对比测试） | `data/idw_nc_radiation_fog/`、`data/vis_img_radiation_fog/` | NetCDF / CSV / PNG |
+| 山谷产品 | `data/assets/dem/valley_fusion_t20_near_m0.nc` | NetCDF |
+| 个例对比 | `output/fog_compare/` | NetCDF / CSV / PNG |
 | 合并 DEM | `h:\data\DEM\merged_dem_data.nc` | NetCDF |
 | 模型评估结果 | `data/model_score/`、`data/cldas_score/` | CSV |
 | 调试可视化 | `debug_visibility_comprehensive*.png` | PNG |
@@ -264,6 +281,7 @@ uv run test_dem_interpolation.py              # DEM 功能测试
 uv run test_visibility_interpolation.py       # 插值正确性测试
 uv run test_boundary_optimization.py          # 边界优化测试
 uv run test_regional_evaluation.py            # 区域评估测试
+uv run python -m unittest discover -s tests -p "test_*.py"   # 业务流水线与辐射雾订正测试
 ```
 
 ### 业务化定时流程
@@ -310,11 +328,26 @@ uv sync
   "sourceReadyDelayMinutes": 2,
   "latestFirst": true,
   "maxBackfillSlotsPerCycle": 1,
-  "asyncPlots": true
+  "asyncPlots": true,
+  "radiationFog": {
+    "enabled": true,
+    "valleyPath": "data/assets/dem/valley_fusion_t20_near_m0.nc",
+    "visThresholdM": 1000,
+    "rhThresholdPct": 95,
+    "precipThresholdMm": 0,
+    "precipMissingAsDry": true,
+    "sigmaZM": 50,
+    "sigmaDKm": 2,
+    "gCutoff": 0.05,
+    "inferRadiusKm": 50,
+    "fillMode": "blend_depth",
+    "ncRoot": "idw_nc_radiation_fog",
+    "imgRoot": "vis_img_radiation_fog"
+  }
 }
 ```
 
-`dataRoot` 是统一数据根目录；CSV、NetCDF、状态库、锁文件和日志的相对路径均相对于它。`demPath` 的相对路径相对于项目根目录，生产环境建议使用绝对路径。默认DEM路径为 `h:\\data\\DEM\\merged_dem_data.nc`，也可以通过 `--dem-path` 临时覆盖。
+`dataRoot` 是统一数据根目录；CSV、NetCDF、状态库、锁文件和日志的相对路径均相对于它。`radiationFog` 段为可选，各参数含义见[山谷辐射雾订正](#山谷辐射雾订正对比测试中)。省略该段或设 `"enabled": false` 时不生成订正产品。`demPath` 的相对路径相对于项目根目录，生产环境建议使用绝对路径。默认DEM路径为 `h:\\data\\DEM\\merged_dem_data.nc`，也可以通过 `--dem-path` 临时覆盖。
 
 单轮执行也可以指定历史时间、配置文件、DEM路径和省份：
 
@@ -430,6 +463,7 @@ pm2 save
 - 估算CSV：由 `csvNationalRoot`、`csvCombinedRoot` 配置，默认位于 `data/vis_estimated_base_nation_station/YYYY/MM/DD/`、`data/vis_estimated_base_nation_and_regional_station/YYYY/MM/DD/`。
 - IDW NetCDF：由 `ncNationalRoot`、`ncCombinedRoot` 配置，默认位于 `data/idw_nc/national/YYYY/MM/DD/`、`data/idw_nc/national_and_regional/YYYY/MM/DD/`。
 - 广东省遮罩图片：由 `visImgRoot` 配置，默认位于 `data/vis_img/YYYY/MM/DD/`，文件名为 `visibility_national_*.png` 和 `visibility_national_and_regional_*.png`。
+- 辐射雾订正产品（启用 `radiationFog` 时）：NetCDF 与站点 CSV 位于 `data/idw_nc_radiation_fog/<路径>/YYYY/MM/DD/`，图片位于 `data/vis_img_radiation_fog/YYYY/MM/DD/`，详见下节。以上原算法产品不受影响。
 
 如需只对已有NetCDF重新绘图，可直接运行绘图模块：
 
@@ -443,7 +477,99 @@ uv run python -m src.business.plot \
 如果配置的 `guangdongBoundaryPath` 不存在，业务数据仍会正常输出，但该资料时次会在日志中提示未生成图片；服务器部署时应把该边界文件路径配置正确。
 - 样本计数、锁文件和运行日志：分别由 `statePath`、`lockPath`、`logPath` 配置。
 
-常驻调度在每小时 `02、07、12、17、22、27、32、37、42、47、52、57` 分启动；每轮扫描世界时前30分钟内、达到 `sourceReadyDelayMinutes` 的5分钟资料时次，先处理最新时次，再从 `observation_queue` 补偿旧时次。业务状态、补偿队列和阶段指标保存在 `data/business/pipeline_state.sqlite`，运行日志保存在 `data/business/business.log`。日志中的 `api_seconds`、`parse_seconds`、`estimate_seconds`、`idw_seconds`、`publish_seconds`、`plot_submit_seconds`、`source_update_time_utc` 和 `data_delay_seconds` 用于统计真实延迟。输出文件按 `YYYY/MM/DD` 分层保存到两个估算CSV目录和 `data/idw_nc/national`、`data/idw_nc/national_and_regional` 目录。
+常驻调度在每小时 `02、07、12、17、22、27、32、37、42、47、52、57` 分启动；每轮扫描世界时前30分钟内、达到 `sourceReadyDelayMinutes` 的5分钟资料时次，先处理最新时次，再从 `observation_queue` 补偿旧时次。业务状态、补偿队列和阶段指标保存在 `data/business/pipeline_state.sqlite`，运行日志保存在 `data/business/business.log`。日志中的 `api_seconds`、`parse_seconds`、`estimate_seconds`、`idw_seconds`、`publish_seconds`、`plot_submit_seconds`、`source_update_time_utc` 和 `data_delay_seconds` 用于统计真实延迟。启用辐射雾订正后，还会记录以下字段：
+- `radiation_fog_seconds`：订正耗时，约 15 秒；
+- `radiation_fog`：每条路径的实测雾站数、虚拟雾站数、影响域数；
+- `radiation_fog_error`：仅在订正失败时出现。
+
+输出文件按 `YYYY/MM/DD` 分层保存到两个估算CSV目录和 `data/idw_nc/national`、`data/idw_nc/national_and_regional` 目录。
+
+#### 山谷辐射雾订正（对比测试中）
+
+订正产品与原算法产品**并行发布**，用于一段时间的对比测试：
+
+- 原算法的 CSV、NetCDF、PNG 的路径、文件名和内容，与引入订正之前完全一致；
+- 订正产品在原算法产品发布之后单独生成；
+- 订正过程中出错时（包括山谷产品缺失），只在日志中告警，原算法产品照常发布，该时次仍记为成功。
+
+**1. 生成山谷产品**：每台机器执行一次，约 15 秒。`data/` 不入库，也可以直接拷贝文件：
+
+```bash
+uv run python -m src.valley_boundary --product
+# 输出 data/assets/dem/valley_fusion_t20_near_m0.nc
+```
+
+**2. 在配置中启用**：加入上文示例中的 `radiationFog` 段。参数说明：
+
+| 配置项 | 默认值 | 说明 |
+|---|---|---|
+| `enabled` | `false` | 是否生成订正产品 |
+| `valleyPath` | `data/assets/dem/valley_fusion_t20_near_m0.nc` | 山谷产品，相对路径相对于项目根目录 |
+| `visThresholdM` | `1000` | 雾站能见度阈值 (m)；同时也是谷缘能见度 |
+| `rhThresholdPct` | `95` | 虚拟雾站的相对湿度阈值 (%) |
+| `precipThresholdMm` | `0` | 1 小时降水 (V13019) 超过此值不判为辐射雾 (mm) |
+| `precipMissingAsDry` | `true` | 降水缺测时按无降水处理 |
+| `sigmaZM` | `50` | 高出雾顶的垂直衰减尺度 (m) |
+| `sigmaDKm` | `2` | 影响域外的水平衰减尺度 (km) |
+| `gCutoff` | `0.05` | 衰减系数 g 低于此值截断为 0 |
+| `inferRadiusKm` | `50` | 虚拟雾站需在此半径内有实测雾站 (km) |
+| `fillMode` | `blend_depth` | 格点合成方式，见下方说明 |
+| `ncRoot` | `idw_nc_radiation_fog` | 订正 NetCDF / CSV 根目录，相对路径相对于 `dataRoot` |
+| `imgRoot` | `vis_img_radiation_fog` | 订正图片根目录，相对路径相对于 `dataRoot` |
+
+`fillMode` 可选值：
+- `blend_depth`：定稿方案，域内按谷底深度渐变；
+- `blend`：域内整体填成雾站值；
+- `blend_linear`：线性混合；
+- `weight`：只给雾站权重乘 g。
+
+后三种保留用于对照。
+
+**3. 输出产品**：`<路径>` 为 `national` 或 `national_and_regional`，日期与 `<时次>` 均为 UTC。
+
+| 产品 | 路径 | 内容 |
+|---|---|---|
+| NetCDF | `<dataRoot>/idw_nc_radiation_fog/<路径>/YYYY/MM/DD/visibility_radiation_fog_<时次>.nc` | 见表下说明 |
+| 站点 CSV | 同目录 `station_vis_radiation_fog_<时次>.csv` | 见表下说明 |
+| 图片 | `<dataRoot>/vis_img_radiation_fog/YYYY/MM/DD/visibility_radiation_fog_<路径>_<时次>.png` | 与原算法图同色标同范围，标出实测雾站（红点）和虚拟雾站（紫色三角） |
+
+- **NetCDF 变量**：
+  - `visibility`：订正后能见度 (m)；
+  - `visibility_original`：原算法能见度 (m)；
+  - `fog_influence`：衰减系数 g，域内为 1。
+
+  全局属性含 `fill_mode` 和雾站统计。
+- **站点 CSV**：在原算法列之外，增加以下列：
+  - `valley_id`；
+  - `is_radiation_fog`：0 为非雾站，1 为实测雾站，2 为虚拟雾站；
+  - `fog_domain_id`；
+  - `pre_1h`；
+  - `vis_original`。
+
+**4. 个例对比与调参**：`src/business/fog_compare.py` 对同一时次同时运行原算法和订正算法。输入按以下优先级获取：
+1. `--national-csv` / `--regional-csv` 指定的本地原始 CSV；
+2. 缓存；
+3. 接口（首次获取后写入缓存）。
+
+```bash
+# 单个或多个 UTC 时次，默认 blend_depth；输出到 output/fog_compare/<时次>/<模式>_<参数>/
+uv run python -m src.business.fog_compare --time 202609202300 202609212200
+
+# 换模式或参数做对照
+uv run python -m src.business.fog_compare --time 202609202300 --fill-mode blend --sigma-d 3
+
+# 各模式跑完后，把原算法和各模式画在同一张图上（不重新计算）
+uv run python -m src.business.fog_compare --time 202609202300 202609212200 --plot-modes
+```
+
+每组结果包含以下文件：
+- 三联对比图：原算法 / 订正 / g 场，有全省图和雾区放大图两种；
+- 两条路径的 NetCDF；
+- 站点 CSV；
+- `stats.csv`：雾站数，以及订正前后能见度 < 500 m 和 < 1 km 的面积；
+- `settings.txt`。
+
+**5. 关闭与回滚**：设 `"enabled": false`，或删除 `radiationFog` 段，即停止生成订正产品。原算法产品始终不受影响。
 
 ## 项目结构
 
@@ -456,11 +582,24 @@ vis_interpolate/
 │   ├── get_vis_estimated_by_rh.py           # 能见度估算
 │   ├── evaluate_visibility_model.py         # 模型评估
 │   ├── tpi_ridge_valley.py                  # 地形分析
-│   └── plot_result.py                       # 可视化工具
+│   ├── valley_boundary.py                   # 山谷识别与山谷产品生成（--product）
+│   ├── plot_result.py                       # 可视化工具
+│   ├── business/                            # 业务化流水线（python -m src.business）
+│   │   ├── pipeline.py                      # 调度、估算、IDW、发布（原算法 + 订正产品）
+│   │   ├── radiation_fog.py                 # 山谷辐射雾订正
+│   │   ├── fog_compare.py                   # 辐射雾个例对比工具
+│   │   ├── plot.py                          # 业务出图（含雾站标记）
+│   │   └── config.py                        # 业务配置（含 radiationFog）
+│   └── config/                              # 配置示例；local/server.config.json 为个人配置，不入库
+├── tests/                                   # 业务流水线单元测试
+├── handoff/                                 # 算法设计与交付文档
 ├── data/                                    # 数据目录
 │   ├── vis_estimated_base_nation_station/   # 国家站估算结果
 │   ├── vis_estimated_base_nation_and_regional_station/
 │   ├── idw_nc/                              # IDW 插值输出
+│   ├── idw_nc_radiation_fog/                # 辐射雾订正 NetCDF / 站点 CSV
+│   ├── vis_img_radiation_fog/               # 辐射雾订正图片
+│   ├── assets/dem/                          # DEM 与山谷产品
 │   ├── model_score/                         # 模型评估结果
 │   └── cldas_score/                         # CLDAS 对比评分
 ├── test_*.py                                # 测试套件

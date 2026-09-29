@@ -15,6 +15,7 @@ from matplotlib import font_manager
 from matplotlib.ft2font import FT2Font
 from matplotlib.ticker import FixedLocator, NullLocator
 import numpy as np
+import pandas as pd
 import xarray as xr
 from matplotlib.colors import BoundaryNorm, ListedColormap, LinearSegmentedColormap
 from shapely import contains_xy
@@ -82,8 +83,12 @@ def plot_visibility(
     output_path: Path,
     *,
     title: str | None = None,
+    stations_path: Path | None = None,
 ) -> Path:
-    """读取一个IDW NetCDF，应用广东遮罩并保存PNG。"""
+    """读取一个IDW NetCDF，应用广东遮罩并保存PNG。
+
+    stations_path 为辐射雾订正后的站点 CSV（含 is_radiation_fog 列）时，标出实测雾站和虚拟雾站。
+    """
     boundary = load_guangdong_boundary(boundary_path)
     with NETCDF_IO_LOCK:
         with xr.open_dataset(nc_path) as dataset:
@@ -117,6 +122,8 @@ def plot_visibility(
     )
     bounds = boundary.total_bounds
     ax.set_extent([bounds[0] - 0.2, bounds[2] + 0.2, bounds[1] - 0.2, bounds[3] + 0.2], ccrs.PlateCarree())
+    if stations_path is not None:
+        _plot_fog_stations(ax, pd.read_csv(stations_path, dtype={"code": str}))
     gridlines = ax.gridlines(draw_labels=True, linewidth=0.5, alpha=0.5)
     gridlines.top_labels = False
     gridlines.right_labels = False
@@ -147,6 +154,25 @@ def plot_visibility(
     fig.savefig(output_path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     return output_path
+
+
+_FOG_STATION_STYLES = (
+    (1, "o", "red", "实测雾站", "Observed fog"),
+    (2, "^", "magenta", "虚拟雾站", "Inferred fog"),
+)
+
+
+def _plot_fog_stations(ax, stations: pd.DataFrame) -> None:
+    """按 is_radiation_fog（1=实测雾站，2=虚拟雾站）标记站点，图例注明数量。"""
+    if "is_radiation_fog" not in stations:
+        return
+    flags = pd.to_numeric(stations["is_radiation_fog"], errors="coerce").fillna(0)
+    for flag, marker, color, label, label_en in _FOG_STATION_STYLES:
+        chosen = stations[flags == flag]
+        text = f"{label if _HAS_CJK_FONT else label_en} ({len(chosen)})"
+        ax.scatter(chosen["lon"], chosen["lat"], s=45, marker=marker, facecolor=color, edgecolor="white",
+                   linewidth=0.6, zorder=5, label=text, transform=ccrs.PlateCarree())
+    ax.legend(loc="lower right", fontsize=10, framealpha=0.85)
 
 
 def plot_cldas_visibility(

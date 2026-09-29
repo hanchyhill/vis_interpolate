@@ -27,13 +27,18 @@ from scipy.spatial import cKDTree
 
 from .algorithms import _estimate_one, reference_sets
 from .config import RadiationFogSettings
-from .idw import _distance_km, create_visibility_grid
+from .idw import _distance_km, _interpolate, create_visibility_grid
 
 FOG_NONE = 0
 FOG_OBSERVED = 1
 FOG_INFERRED = 2
 EARTH_KM_PER_DEG = 111.32
 FOG_COLUMNS = ["valley_id", "is_radiation_fog", "fog_domain_id", "pre_1h"]
+# 对数混合时的能见度下限 (m)，避免 0 m 观测使整片过渡带变为 0。
+_MIN_BLEND_VIS_M = 10.0
+_MIN_DEPTH_RANGE_M = 10.0   # 雾顶与谷底高差的下限，避免浅谷中相对深度被放大
+_MIN_SEED_DEPTH = 0.1       # 雾站相对深度下限，避免雾站贴近雾顶时指数失控
+_MAX_DEPTH_EXPONENT = 2.0   # 谷底相对雾站最多再降低一个同样的对数幅度
 
 
 @dataclass
@@ -162,13 +167,14 @@ class FogInfluence:
             result[rows] = domain.window_values(domain.distance_km, iy[rows], ix[rows], np.inf) == 0
         return result
 
-    def max_field(self) -> np.ndarray:
-        """各格点受雾站影响的 g 最大值。"""
+    def max_field(self, *, fill_domain: bool = False) -> np.ndarray:
+        """各格点受雾站影响的 g 最大值；fill_domain=True 时影响域内取 1（blend 模式）。"""
         field_ = np.zeros(self.product.valley_id.shape, dtype=np.float32)
         for domain in self.domains.values():
             ny, nx = domain.g.shape
+            g = np.where(domain.distance_km == 0, 1.0, domain.g) if fill_domain else domain.g
             window = field_[domain.y0:domain.y0 + ny, domain.x0:domain.x0 + nx]
-            np.maximum(window, domain.g.astype(np.float32), out=window)
+            np.maximum(window, g.astype(np.float32), out=window)
         return field_
 
 
@@ -347,14 +353,110 @@ class RadiationFogModel:
 
 
 def estimate_both_corrected(
-    national: pd.DataFrame, regional: pd.DataFrame, model: RadiationFogModel
+    national: pd.DataFrame, regional: pd.DataFrame, model: RadiationFogModel,
+    sources: tuple[str, ...] = ("national", "national_and_regional"),
 ) -> dict[str, CorrectedEstimate]:
     """与 estimate_both 相同的两条参考路径，分别做辐射雾判别与订正。"""
     national_ref, combined_ref, regional_target = reference_sets(national, regional)
-    return {
-        "national": model.estimate(national_ref, regional_target),
-        "national_and_regional": model.estimate(combined_ref, regional_target),
-    }
+    references = {"national": national_ref, "national_and_regional": combined_ref}
+    return {source: model.estimate(references[source], regional_target) for source in sources}
+
+
+def _seed_idw(seeds: pd.DataFrame, values: np.ndarray, lons: np.ndarray, lats: np.ndarray,
+              elevation: np.ndarray, *, beta: float, power: float) -> np.ndarray:
+    """用 seeds 的位置对 values 做各向异性 IDW；与站点重合的格点取最近站的值。"""
+    frame = seeds.assign(vis=values)
+    result = _interpolate(frame, lons, lats, elevation, beta=beta, power=power, n_neighbors=len(frame))
+    coincident = ~np.isfinite(result) & np.isfinite(elevation)
+    if coincident.any():
+        distance = _distance_km(lats[coincident, None], lons[coincident, None],
+                                frame["lat"].to_numpy(float)[None, :], frame["lon"].to_numpy(float)[None, :])
+        result[coincident] = np.asarray(values, dtype=float)[np.argmin(distance, axis=1)]
+    return result
+
+
+def _depth_profile(domain: FogDomain, seeds: pd.DataFrame, seed_z: np.ndarray, fog_vis: np.ndarray,
+                   rows: np.ndarray, cols: np.ndarray, lons: np.ndarray, lats: np.ndarray,
+                   elevation: np.ndarray, edge_vis_m: float, *, beta: float, power: float) -> np.ndarray:
+    """按相对深度调整雾区能见度（blend_depth）。
+
+    相对深度 r = (雾顶 − z) / (雾顶 − 谷底)，谷底取域内 DEM 海拔的 5% 分位数，截断到 [0, 1]；
+    雾站深度 r_s 用站点所在格点的 DEM 海拔 seed_z 计算（站点海拔与 0.01° DEM 可相差上百米，
+    混用会使雾站显得偏浅），再插值为 r̄。对数空间沿深度线性变化：
+    V = V_edge · (V_fog / V_edge)^(r / r̄)，r = r̄ 时等于雾站插值，r = 0（雾顶/域外）时为
+    V_edge = max(edge_vis_m, V_fog)，更深处继续降低，指数上限 _MAX_DEPTH_EXPONENT。
+    """
+    window = elevation[domain.y0:domain.y0 + domain.distance_km.shape[0],
+                       domain.x0:domain.x0 + domain.distance_km.shape[1]]
+    inside_window = (domain.distance_km == 0) & np.isfinite(window)
+    floor = float(np.nanpercentile(window[inside_window], 5)) if inside_window.any() else domain.fog_top_m
+    height = max(domain.fog_top_m - floor, _MIN_DEPTH_RANGE_M)
+    seed_depth = np.clip((domain.fog_top_m - seed_z) / height, 0.0, 1.0)
+    mean_depth = _seed_idw(seeds, seed_depth, lons, lats, elevation[rows, cols], beta=beta, power=power)
+    mean_depth = np.maximum(np.nan_to_num(mean_depth, nan=1.0), _MIN_SEED_DEPTH)
+    inside = domain.distance_km[rows - domain.y0, cols - domain.x0] == 0
+    depth = np.where(inside, np.clip((domain.fog_top_m - elevation[rows, cols]) / height, 0.0, 1.0), 0.0)
+    edge = np.maximum(edge_vis_m, fog_vis)
+    exponent = np.minimum(depth / mean_depth, _MAX_DEPTH_EXPONENT)
+    return edge * (np.maximum(fog_vis, _MIN_BLEND_VIS_M) / edge) ** exponent
+
+
+def blend_fog_grid(stations: pd.DataFrame, dem: xr.Dataset, influence: FogInfluence,
+                   *, beta: float = 10.0, power: float = 2.0, linear: bool = False,
+                   depth: bool = False) -> xr.DataArray:
+    """域内填充：默认在对数空间混合，V = V_fog^g · V_base^(1 − g)。
+
+    V_base 为去掉全部雾域站（fog_domain_id > 0）后的原 IDW；V_fog 只用本影响域内的雾站
+    （实测与虚拟）做各向异性 IDW。影响域内一律取 g = 1（不做垂直衰减），使雾区边缘与
+    山谷边界一致；域外沿用 g 的衰减。格点受多个影响域覆盖时取 g 最大的影响域。
+    linear=True 时为线性混合 V = g·V_fog + (1 − g)·V_base，且域内保留垂直衰减。
+    depth=True 时 V_fog 再按相对深度调整（谷底最低、向雾顶升到 visThresholdM），见 _depth_profile。
+    """
+    domain_ids = stations["fog_domain_id"].fillna(0).to_numpy(dtype=np.int64)
+    base = create_visibility_grid(stations[domain_ids == 0], dem, beta=beta, power=power)
+    result = base.values.copy()
+    best = np.zeros(result.shape)
+    lons = np.asarray(dem.lon.values, dtype=float)
+    lats = np.asarray(dem.lat.values, dtype=float)
+    elevation = np.asarray(dem["elevation"].values, dtype=float)
+    fog = stations["is_radiation_fog"].fillna(0).to_numpy() > 0
+    for domain_id, domain in influence.domains.items():
+        seeds = stations[(domain_ids == domain_id) & fog].dropna(subset=["lon", "lat", "vis", "altitude"])
+        if seeds.empty:
+            continue
+        g_fill = domain.g if linear else np.where(domain.distance_km == 0, 1.0, domain.g)
+        rows, cols = np.nonzero(g_fill > 0)
+        gy, gx = rows + domain.y0, cols + domain.x0
+        g = g_fill[rows, cols]
+        replace = g > best[gy, gx]
+        gy, gx, g = gy[replace], gx[replace], g[replace]
+        if gy.size == 0:
+            continue
+        fog_vis = _seed_idw(seeds, seeds["vis"].to_numpy(float), lons[gx], lats[gy], elevation[gy, gx],
+                            beta=beta, power=power)
+        if depth:
+            sy, sx, _ = influence.product.cell_index(seeds["lon"].to_numpy(float), seeds["lat"].to_numpy(float))
+            seed_z = elevation[sy, sx]
+            seed_z = np.where(np.isfinite(seed_z), seed_z, seeds["altitude"].to_numpy(float))
+            fog_vis = _depth_profile(domain, seeds, seed_z, fog_vis, gy, gx, lons[gx], lats[gy], elevation,
+                                     influence.settings.vis_threshold_m, beta=beta, power=power)
+        valid = np.isfinite(fog_vis) & np.isfinite(result[gy, gx])
+        gy, gx, g, fog_vis = gy[valid], gx[valid], g[valid], fog_vis[valid]
+        if linear:
+            result[gy, gx] = g * fog_vis + (1.0 - g) * base.values[gy, gx]
+        else:
+            log_fog = np.log(np.maximum(fog_vis, _MIN_BLEND_VIS_M))
+            log_base = np.log(np.maximum(base.values[gy, gx], _MIN_BLEND_VIS_M))
+            result[gy, gx] = np.exp(g * log_fog + (1.0 - g) * log_base)
+        best[gy, gx] = g
+    if linear:
+        method = "blend_linear: g*V_fog + (1-g)*V_base"
+    elif depth:
+        method = "blend_depth: V_fog scaled by relative depth below fog top, then V_fog^g * V_base^(1-g)"
+    else:
+        method = "blend: V_fog^g * V_base^(1-g), g=1 inside domain"
+    attrs = {**base.attrs, "radiation_fog_correction": method}
+    return xr.DataArray(result, coords=base.coords, dims=base.dims, name="visibility", attrs=attrs)
 
 
 @dataclass
@@ -374,13 +476,18 @@ def build_corrected_products(
 ) -> dict[str, CorrectedProduct]:
     """在原算法结果基础上生成订正产品；某路径无雾站时订正结果直接复用原算法格点。"""
     products: dict[str, CorrectedProduct] = {}
-    for source, corrected in estimate_both_corrected(national, regional, model).items():
+    for source, corrected in estimate_both_corrected(national, regional, model, sources=tuple(original_estimates)).items():
         original = original_estimates[source][["code", "vis"]].rename(columns={"vis": "vis_original"})
         frame = corrected.frame.merge(original, on="code", how="left")
         grid = original_grids[source]
         if not corrected.influence.empty:
-            grid = create_visibility_grid(frame, dem, fog_influence=corrected.influence)
-        influence = corrected.influence.max_field()
+            if model.settings.fill_mode == "weight":
+                grid = create_visibility_grid(frame, dem, fog_influence=corrected.influence)
+            else:
+                grid = blend_fog_grid(frame, dem, corrected.influence,
+                                      linear=model.settings.fill_mode == "blend_linear",
+                                      depth=model.settings.fill_mode == "blend_depth")
+        influence = corrected.influence.max_field(fill_domain=model.settings.fill_mode in ("blend", "blend_depth"))
         dataset = xr.Dataset(
             {
                 "visibility": grid.rename("visibility"),
@@ -390,7 +497,8 @@ def build_corrected_products(
                     "long_name": "各格点受辐射雾站影响的权重修正系数 g 的最大值",
                 }),
             },
-            attrs={"radiation_fog_correction": 1, "valley_path": str(model.settings.valley_path),
+            attrs={"radiation_fog_correction": 1, "fill_mode": model.settings.fill_mode,
+                   "valley_path": str(model.settings.valley_path),
                    **{f"fog_{key}": value for key, value in corrected.summary.items()}},
         )
         dataset["visibility_original"].attrs["description"] = "原算法（未做辐射雾订正）能见度，单位为米"

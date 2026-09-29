@@ -203,30 +203,6 @@ def _build_outputs(
         for source, frame in estimates.items()
     }
     timings["idw_seconds"] = round(time.perf_counter() - idw_started, 3)
-    frames: dict[str, Any] = dict(estimates)
-    nc_objects: dict[str, Any] = dict(grids)
-    logger = logging.getLogger("vis_interpolate.business")
-    fog_started = time.perf_counter()
-    try:
-        with NETCDF_IO_LOCK:
-            fog_model = load_radiation_fog_model(config.radiation_fog, dem, logger)
-        corrected = (
-            build_corrected_products(batch.national, batch.regional, dem, fog_model, estimates, grids)
-            if fog_model is not None else None
-        )
-    except Exception:  # noqa: BLE001 - 订正失败时仍发布原算法结果
-        logger.exception("辐射雾订正失败，本时次退回原算法")
-        corrected = None
-    if corrected is not None:
-        for source, product in corrected.items():
-            frames[source] = product.frame
-            nc_objects[source] = product.dataset
-        timings["radiation_fog_seconds"] = round(time.perf_counter() - fog_started, 3)
-        timings["radiation_fog"] = {source: product.summary for source, product in corrected.items()}
-        missing = max(product.summary["low_vis_in_valley_precip_missing"] for product in corrected.values())
-        if missing:
-            logger.info("辐射雾判别：%s 个山谷低能见度站降水缺测，按%s处理", missing,
-                        "无降水" if config.radiation_fog.precip_missing_as_dry else "有降水")
 
     date_parts = (observation_time.strftime("%Y"), observation_time.strftime("%m"), observation_time.strftime("%d"))
     stamp = observation_time.strftime("%Y%m%d%H%M")
@@ -248,14 +224,40 @@ def _build_outputs(
             *date_parts, f"visibility_national_and_regional_{stamp}.png"
         ),
     }
-    for path in [*csv_paths.values(), *nc_paths.values(), *image_paths.values()]:
-        path.parent.mkdir(parents=True, exist_ok=True)
-
     generated_at = datetime.now(timezone.utc).isoformat()
     timings["generated_at_utc"] = generated_at
-    data_outputs: list[str] = []
     publish_started = time.perf_counter()
-    with tempfile.TemporaryDirectory(prefix=f"business_{stamp}_", dir=config.state_path.parent) as temp_dir:
+    outputs = _publish(observation_time, batch, config, dict(estimates), dict(grids),
+                       csv_paths, nc_paths, generated_at, f"business_{stamp}_")
+    timings["publish_seconds"] = round(time.perf_counter() - publish_started, 3)
+
+    plot_started = time.perf_counter()
+    title_stamp = _beijing_timestamp(observation_time, "%Y%m%d%H%M")
+    outputs.extend(_plot_all(config, nc_paths, image_paths, lambda source: f"广东省能见度 - {source} - {title_stamp}"))
+    timings["plot_submit_seconds"] = round(time.perf_counter() - plot_started, 3)
+
+    outputs.extend(_build_radiation_fog_outputs(
+        observation_time, batch, config, dem, estimates, grids, generated_at, timings,
+    ))
+    return outputs
+
+
+def _publish(
+    observation_time: datetime,
+    batch: StationBatch,
+    config: BusinessConfig,
+    frames: dict[str, Any],
+    nc_objects: dict[str, Any],
+    csv_paths: dict[str, Path],
+    nc_paths: dict[str, Path],
+    generated_at: str,
+    temp_prefix: str,
+) -> list[str]:
+    """先写入临时目录，再逐个原子替换到发布路径。"""
+    for path in [*csv_paths.values(), *nc_paths.values()]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    data_outputs: list[str] = []
+    with tempfile.TemporaryDirectory(prefix=temp_prefix, dir=config.state_path.parent) as temp_dir:
         temp = Path(temp_dir)
         staged: list[tuple[Path, Path]] = []
         for source, frame in frames.items():
@@ -279,44 +281,103 @@ def _build_outputs(
         for source_temp, destination in staged:
             source_temp.replace(destination)
             data_outputs.append(str(destination))
-    timings["publish_seconds"] = round(time.perf_counter() - publish_started, 3)
+    return data_outputs
 
-    if config.guangdong_boundary_path.exists():
-        plot_started = time.perf_counter()
+
+def _plot_all(config: BusinessConfig, nc_paths: dict[str, Path], image_paths: dict[str, Path], title,
+              stations_paths: dict[str, Path] | None = None) -> list[str]:
+    if not config.guangdong_boundary_path.exists():
+        return []
+    for source, nc_path in nc_paths.items():
+        image_paths[source].parent.mkdir(parents=True, exist_ok=True)
+        stations_path = stations_paths.get(source) if stations_paths else None
+        if config.async_plots:
+            _submit_plot(nc_path, config.guangdong_boundary_path, image_paths[source], title(source), stations_path)
+        else:
+            _render_plot_job(nc_path, config.guangdong_boundary_path, image_paths[source], title(source),
+                             stations_path)
+    return [str(image_paths[source]) for source in nc_paths]
+
+
+def radiation_fog_paths(config: BusinessConfig, observation_time: datetime) -> dict[str, dict[str, Path]]:
+    """辐射雾订正产品路径：{"csv"|"nc"|"image": {source: path}}，与原算法产品分开存放。"""
+    date_parts = (observation_time.strftime("%Y"), observation_time.strftime("%m"), observation_time.strftime("%d"))
+    stamp = observation_time.strftime("%Y%m%d%H%M")
+    sources = ("national", "national_and_regional")
+    nc_root, img_root = config.radiation_fog_nc_root, config.radiation_fog_img_root
+    return {
+        "csv": {s: nc_root.joinpath(s, *date_parts, f"station_vis_radiation_fog_{stamp}.csv") for s in sources},
+        "nc": {s: nc_root.joinpath(s, *date_parts, f"visibility_radiation_fog_{stamp}.nc") for s in sources},
+        "image": {s: img_root.joinpath(*date_parts, f"visibility_radiation_fog_{s}_{stamp}.png") for s in sources},
+    }
+
+
+def _build_radiation_fog_outputs(
+    observation_time: datetime,
+    batch: StationBatch,
+    config: BusinessConfig,
+    dem: xr.Dataset,
+    estimates: dict[str, Any],
+    grids: dict[str, Any],
+    generated_at: str,
+    timings: dict[str, Any],
+) -> list[str]:
+    """在原算法产品发布之后单独生成订正产品；任何异常只记录日志，不影响原算法产品和时次状态。"""
+    logger = logging.getLogger("vis_interpolate.business")
+    if not config.radiation_fog.enabled:
+        return []
+    started = time.perf_counter()
+    try:
+        with NETCDF_IO_LOCK:
+            fog_model = load_radiation_fog_model(config.radiation_fog, dem, logger)
+        if fog_model is None:
+            return []
+        corrected = build_corrected_products(batch.national, batch.regional, dem, fog_model, estimates, grids)
+        timings["radiation_fog"] = {source: product.summary for source, product in corrected.items()}
+        missing = max(product.summary["low_vis_in_valley_precip_missing"] for product in corrected.values())
+        if missing:
+            logger.info("辐射雾判别：%s 个山谷低能见度站降水缺测，按%s处理", missing,
+                        "无降水" if config.radiation_fog.precip_missing_as_dry else "有降水")
+        paths = radiation_fog_paths(config, observation_time)
+        stamp = observation_time.strftime("%Y%m%d%H%M")
+        outputs = _publish(
+            observation_time, batch, config,
+            {source: product.frame for source, product in corrected.items()},
+            {source: product.dataset for source, product in corrected.items()},
+            paths["csv"], paths["nc"], generated_at, f"business_fog_{stamp}_",
+        )
         title_stamp = _beijing_timestamp(observation_time, "%Y%m%d%H%M")
-        for source, nc_path in nc_paths.items():
-            if config.async_plots:
-                _submit_plot(
-                    nc_path,
-                    config.guangdong_boundary_path,
-                    image_paths[source],
-                    f"广东省能见度 - {source} - {title_stamp}",
-                )
-            else:
-                _render_plot_job(
-                    nc_path,
-                    config.guangdong_boundary_path,
-                    image_paths[source],
-                    f"广东省能见度 - {source} - {title_stamp}",
-                )
-        timings["plot_submit_seconds"] = round(time.perf_counter() - plot_started, 3)
-    return [*data_outputs, *[str(path) for path in image_paths.values() if config.guangdong_boundary_path.exists()]]
+        mode = config.radiation_fog.fill_mode
+        outputs.extend(_plot_all(
+            config, paths["nc"], paths["image"],
+            lambda source: f"广东省能见度（辐射雾订正 {mode}）- {source} - {title_stamp}",
+            stations_paths=paths["csv"],
+        ))
+        return outputs
+    except Exception:  # noqa: BLE001 - 订正产品失败不影响原算法产品
+        logger.exception("%s 辐射雾订正产品生成失败，原算法产品不受影响", observation_time.strftime("%Y%m%d%H%M"))
+        timings["radiation_fog_error"] = True
+        return []
+    finally:
+        timings["radiation_fog_seconds"] = round(time.perf_counter() - started, 3)
 
 
-def _submit_plot(nc_path: Path, boundary_path: Path, output_path: Path, title: str) -> None:
+def _submit_plot(nc_path: Path, boundary_path: Path, output_path: Path, title: str,
+                 stations_path: Path | None = None) -> None:
     global _PLOT_EXECUTOR
     with _PLOT_EXECUTOR_LOCK:
         if _PLOT_EXECUTOR is None:
             _PLOT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="visibility-plot")
-        _PLOT_EXECUTOR.submit(_render_plot_job, nc_path, boundary_path, output_path, title)
+        _PLOT_EXECUTOR.submit(_render_plot_job, nc_path, boundary_path, output_path, title, stations_path)
 
 
-def _render_plot_job(nc_path: Path, boundary_path: Path, output_path: Path, title: str) -> None:
+def _render_plot_job(nc_path: Path, boundary_path: Path, output_path: Path, title: str,
+                     stations_path: Path | None = None) -> None:
     started = time.perf_counter()
     try:
         with tempfile.TemporaryDirectory(prefix=f".{output_path.stem}_", dir=output_path.parent) as temp_dir:
             temporary_output = Path(temp_dir) / output_path.name
-            plot_visibility(nc_path, boundary_path, temporary_output, title=title)
+            plot_visibility(nc_path, boundary_path, temporary_output, title=title, stations_path=stations_path)
             temporary_output.replace(output_path)
         logging.getLogger("vis_interpolate.business").info(
             "%s 图片生成完成 plot_seconds=%.3f",
